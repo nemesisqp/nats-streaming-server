@@ -8,6 +8,7 @@ import (
 	"os"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -58,7 +59,7 @@ func stackFatalf(t tLogger, f string, args ...interface{}) {
 	// Generate the Stack of callers:
 	for i := 1; true; i++ {
 		_, file, line, ok := runtime.Caller(i)
-		if ok == false {
+		if !ok {
 			break
 		}
 		msg := fmt.Sprintf("%d - %s:%d", i, file, line)
@@ -266,7 +267,7 @@ func TestDefaultOptions(t *testing.T) {
 
 	opts2 := GetDefaultOptions()
 	if opts2.Debug == opts.Debug {
-		t.Fatal("Modified original default options.")
+		t.Fatal("Modified original default options")
 	}
 }
 
@@ -964,7 +965,7 @@ func TestQueueSubsWithDifferentAckWait(t *testing.T) {
 	select {
 	case <-rch3:
 	// ok
-	case <-time.After(time.Second):
+	case <-time.After(1500 * time.Millisecond):
 		t.Fatal("Message should have been redelivered")
 	}
 }
@@ -1198,7 +1199,7 @@ func getTestDefaultOptsForFileStore() *Options {
 
 func testStalledRedelivery(t *testing.T, typeSub string) {
 	cleanupDatastore(t, defaultDataStore)
-	defer cleanupDatastore(t, defaultDataStore)
+	// defer cleanupDatastore(t, defaultDataStore)
 
 	opts := getTestDefaultOptsForFileStore()
 	s := RunServerWithOpts(opts, nil)
@@ -2069,7 +2070,7 @@ func TestClientCrashAndReconnect(t *testing.T) {
 		defer sc2.Close()
 	}
 
-	duration := time.Now().Sub(start)
+	duration := time.Since(start)
 	if duration > 5*time.Second {
 		t.Fatalf("Took too long to be able to connect: %v", duration)
 	}
@@ -2801,7 +2802,7 @@ func TestCheckClientHealthDontKeepClientLock(t *testing.T) {
 	// This is to avoid staticcheck "empty critical section (SA2001)" report
 	_ = c.fhb
 	c.RUnlock()
-	dur := time.Now().Sub(start)
+	dur := time.Since(start)
 	// This should have taken less than HB Timeout
 	if dur >= opts.ClientHBTimeout {
 		t.Fatalf("Client may be locked for the duration of the HB request: %v", dur)
@@ -2847,7 +2848,7 @@ func TestConnectsWithDupCID(t *testing.T) {
 	connect := func(cid string, shouldFail bool) (stan.Conn, time.Duration, error) {
 		start := time.Now()
 		c, err := stan.Connect(clusterName, cid, stan.ConnectWait(3*s.dupCIDTimeout))
-		duration := time.Now().Sub(start)
+		duration := time.Since(start)
 		if shouldFail {
 			if c != nil {
 				c.Close()
@@ -3711,7 +3712,7 @@ func TestEnsureStandAlone(t *testing.T) {
 			if failedServer != nil {
 				failedServer.Shutdown()
 			}
-			t.Fatal("Server did not detect a duplicate instance.")
+			t.Fatal("Server did not detect a duplicate instance")
 		}
 	}()
 
@@ -4370,9 +4371,9 @@ func TestQueueSubscriberTransferPendingMsgsOnClose(t *testing.T) {
 	qsetup := make(chan bool)
 	cb := func(m *stan.Msg) {
 		<-qsetup
-		if m.Sub == sub1 && m.Sequence == 1 && m.Redelivered == false {
+		if m.Sub == sub1 && m.Sequence == 1 && !m.Redelivered {
 			ch <- true
-		} else if m.Sub == sub2 && m.Sequence == 1 && m.Redelivered == true {
+		} else if m.Sub == sub2 && m.Sequence == 1 && m.Redelivered {
 			ch <- true
 		}
 	}
@@ -5458,6 +5459,9 @@ func closeSubscriber(t *testing.T, subType string) {
 			stan.DeliverAllAvailable(),
 			stan.DurableName(durName))
 	}
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
 	wait()
 	// Unsubscribe for good
 	if err := sub.Unsubscribe(); err != nil {
@@ -5706,4 +5710,357 @@ func TestAckPublisherBufSize(t *testing.T) {
 	iopm.pm.Guid = "this is a very very very very very very very very very very very very very very very very very very long guid"
 	s.ackPublisher(iopm)
 	checkErr()
+}
+
+func TestDontSendEmptyMsgProto(t *testing.T) {
+	s := RunServer(clusterName)
+	defer s.Shutdown()
+
+	nc, err := nats.Connect(nats.DefaultURL, nats.NoReconnect())
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	sc, err := stan.Connect(clusterName, clientName, stan.NatsConn(nc))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	// Since server is expected to crash, do not attempt to close sc
+	// because it would delay test by 2 seconds.
+
+	if _, err := sc.Subscribe("foo", func(_ *stan.Msg) {}); err != nil {
+		t.Fatalf("Unexpected error on subscribe: %v", err)
+	}
+
+	waitForNumSubs(t, s, clientName, 1)
+
+	subs := s.clients.GetSubs(clientName)
+	sub := subs[0]
+
+	defer func() {
+		if r := recover(); r != nil {
+			// Ok!
+		}
+	}()
+
+	m := &pb.MsgProto{}
+	sub.Lock()
+	s.sendMsgToSub(sub, m, false)
+	sub.Unlock()
+
+	t.Fatal("Server should have panic'ed")
+}
+
+func TestMsgsNotSentToSubBeforeSubReqResponse(t *testing.T) {
+	s := RunServer(clusterName)
+	defer s.Shutdown()
+
+	// Use a bare NATS connection to send incorrect requests
+	nc, err := nats.Connect(nats.DefaultURL)
+	if err != nil {
+		t.Fatalf("Unexpected error on connect: %v", err)
+	}
+	defer nc.Close()
+
+	// Get the connect subject
+	connSubj := fmt.Sprintf("%s.%s", s.opts.DiscoverPrefix, clusterName)
+	connReq := &pb.ConnectRequest{
+		ClientID:       clientName,
+		HeartbeatInbox: nats.NewInbox(),
+	}
+	crb, _ := connReq.Marshal()
+	respMsg, err := nc.Request(connSubj, crb, 5*time.Second)
+	if err != nil {
+		t.Fatalf("Request error: %v", err)
+	}
+	connResponse := &pb.ConnectResponse{}
+	connResponse.Unmarshal(respMsg.Data)
+
+	subSubj := connResponse.SubRequests
+	unsubSubj := connResponse.UnsubRequests
+	pubSubj := connResponse.PubPrefix + ".foo"
+
+	pubMsg := &pb.PubMsg{
+		ClientID: clientName,
+		Subject:  "foo",
+		Data:     []byte("hello"),
+	}
+	subReq := &pb.SubscriptionRequest{
+		ClientID:      clientName,
+		MaxInFlight:   1024,
+		Subject:       "foo",
+		StartPosition: pb.StartPosition_First,
+		AckWaitInSecs: 30,
+	}
+	unsubReq := &pb.UnsubscribeRequest{
+		ClientID: clientName,
+		Subject:  "foo",
+	}
+	for i := 0; i < 100; i++ {
+		// Use the same subscriber for subscription request response and data,
+		// so we can reliably check if data comes before response.
+		inbox := nats.NewInbox()
+		sub, err := nc.SubscribeSync(inbox)
+		if err != nil {
+			t.Fatalf("Unable to create nats subscriber: %v", err)
+		}
+		subReq.Inbox = inbox
+		bytes, _ := subReq.Marshal()
+		// Send the request with inbox as the Reply
+		if err := nc.PublishRequest(subSubj, inbox, bytes); err != nil {
+			t.Fatalf("Error sending request: %v", err)
+		}
+		// Followed by a data message
+		pubMsg.Guid = nuid.Next()
+		bytes, _ = pubMsg.Marshal()
+		if err := nc.Publish(pubSubj, bytes); err != nil {
+			t.Fatalf("Error sending msg: %v", err)
+		}
+		nc.Flush()
+		// Dequeue
+		msg, err := sub.NextMsg(2 * time.Second)
+		if err != nil {
+			t.Fatalf("Did not get our message: %v", err)
+		}
+		// It should always be the subscription response!!!
+		msgProto := &pb.MsgProto{}
+		err = msgProto.Unmarshal(msg.Data)
+		if err == nil && msgProto.Sequence != 0 {
+			t.Fatalf("Iter=%v - Did not receive valid subscription response: %#v - %v", (i + 1), msgProto, err)
+		}
+		subReqResp := &pb.SubscriptionResponse{}
+		subReqResp.Unmarshal(msg.Data)
+		unsubReq.Inbox = subReqResp.AckInbox
+		bytes, _ = unsubReq.Marshal()
+		if err := nc.Publish(unsubSubj, bytes); err != nil {
+			t.Fatalf("Unable to send unsub request: %v", err)
+		}
+		sub.Unsubscribe()
+	}
+}
+
+func TestFileStoreAcksPool(t *testing.T) {
+	cleanupDatastore(t, defaultDataStore)
+	defer cleanupDatastore(t, defaultDataStore)
+
+	opts := getTestDefaultOptsForFileStore()
+	opts.AckSubsPoolSize = 5
+	s := RunServerWithOpts(opts, nil)
+	defer shutdownRestartedServerOnTestExit(&s)
+
+	var allSubs []stan.Subscription
+
+	// Check server's ackSub pool
+	checkPoolSize := func() {
+		s.RLock()
+		poolSize := len(s.acksSubs)
+		s.RUnlock()
+		if poolSize != opts.AckSubsPoolSize {
+			stackFatalf(t, "Expected acksSubs pool size to be %v, got %v", opts.AckSubsPoolSize, poolSize)
+		}
+	}
+	checkPoolSize()
+
+	// Check total subs and each sub's ackSub is pooled or not as expected.
+	checkAckSubs := func(total int, checkSubFunc func(sub *subState) error) {
+		subs := s.clients.GetSubs(clientName)
+		if len(subs) != total {
+			stackFatalf(t, "Expected %d subs, got %v", total, len(subs))
+		}
+		for _, sub := range subs {
+			sub.RLock()
+			err := checkSubFunc(sub)
+			sub.RUnlock()
+			if err != nil {
+				stackFatalf(t, err.Error())
+			}
+		}
+	}
+
+	sc, nc := createConnectionWithNatsOpts(t, clientName,
+		nats.ReconnectWait(100*time.Millisecond))
+	defer nc.Close()
+	defer sc.Close()
+
+	totalSubs := 10
+	errCh := make(chan error, totalSubs)
+	ch := make(chan bool)
+	count := int32(0)
+	cb := func(m *stan.Msg) {
+		if m.Redelivered {
+			errCh <- fmt.Errorf("Unexpected redelivered message: %v", m)
+		} else if atomic.AddInt32(&count, 1) == int32(totalSubs) {
+			ch <- true
+		}
+	}
+	// Create 10 subs
+	for i := 0; i < totalSubs; i++ {
+		sub, err := sc.Subscribe("foo", cb, stan.AckWait(time.Second))
+		if err != nil {
+			t.Fatalf("Unexpected error on subscribe: %v", err)
+		}
+		allSubs = append(allSubs, sub)
+	}
+	// Send 1 message
+	if err := sc.Publish("foo", []byte("hello")); err != nil {
+		t.Fatalf("Unexpected error on publish: %v", err)
+	}
+	// Wait for all messages to be received
+	if err := Wait(ch); err != nil {
+		t.Fatal("Did not get our messages")
+	}
+	// Wait for more than redelivery time
+	time.Sleep(1500 * time.Millisecond)
+	// Check that there was no error
+	select {
+	case e := <-errCh:
+		t.Fatal(e)
+	default:
+	}
+	// Check that server's subs have nil ackSub
+	checkAckSubs(totalSubs, func(sub *subState) error {
+		if sub.ackSub != nil {
+			return fmt.Errorf("Expected ackSub for sub %v to be nil, was not", sub.ID)
+		}
+		return nil
+	})
+	// Stop server and restart with lower pool size
+	s.Shutdown()
+	opts.AckSubsPoolSize = 2
+	s = RunServerWithOpts(opts, nil)
+	// Check server's ackSub pool
+	checkPoolSize()
+	// Check that AckInbox with ackSubIndex > AcksPoolSize-1 have
+	// individual ackSub
+	checkAckSubs(totalSubs, func(sub *subState) error {
+		wantsNil := false
+		ackSubIndexEnd := strings.Index(sub.AckInbox, ".")
+		if n, _ := strconv.Atoi(sub.AckInbox[:ackSubIndexEnd]); n <= 1 {
+			wantsNil = true
+		}
+		if wantsNil && sub.ackSub != nil {
+			return fmt.Errorf("Expected ackSub for sub %v to be nil, was not", sub.ID)
+		} else if !wantsNil && sub.ackSub == nil {
+			return fmt.Errorf("Expected ackSub for sub %v to be not nil, was nil", sub.ID)
+		}
+		return nil
+	})
+	// Restart server with no acksSub pool
+	s.Shutdown()
+	opts.AckSubsPoolSize = 0
+	s = RunServerWithOpts(opts, nil)
+	// Check server's ackSub pool
+	checkPoolSize()
+	// Check that all subs have an individual ackSub
+	checkAckSubs(totalSubs, func(sub *subState) error {
+		if sub.ackSub == nil {
+			return fmt.Errorf("Expected ackSub for sub %v to be not nil, was nil", sub.ID)
+		}
+		return nil
+	})
+	// Add another subscriber
+	sub, err := sc.Subscribe("foo", func(_ *stan.Msg) {})
+	if err != nil {
+		t.Fatalf("Unexpected error on subscribe: %v", err)
+	}
+	allSubs = append(allSubs, sub)
+	// Restart server
+	s.Shutdown()
+	s = RunServerWithOpts(opts, nil)
+	// Check that the new sub's AckInbox is _INBOX as usual.
+	checkAckSubs(totalSubs+1, func(sub *subState) error {
+		if int(sub.ID) > totalSubs {
+			if sub.AckInbox[:len(nats.InboxPrefix)] != nats.InboxPrefix {
+				return fmt.Errorf("Unexpected AckInbox: %v", sub)
+			}
+		}
+		if sub.ackSub == nil {
+			return fmt.Errorf("Expected ackSub for sub %v to be not nil, was nil", sub.ID)
+		}
+		return nil
+	})
+	// Restart server with ackPool
+	s.Shutdown()
+	opts.AckSubsPoolSize = 2
+	s = RunServerWithOpts(opts, nil)
+	// Check server's ackSub pool
+	checkPoolSize()
+	// Check that unsubscribe work ok
+	for _, sub := range allSubs {
+		if err := sub.Unsubscribe(); err != nil {
+			t.Fatalf("Error on unsubscribe: %v", err)
+		}
+	}
+	// Create a subscription without call unsubscribe and make
+	// sure it does not prevent closing of connection.
+	if _, err := sc.Subscribe("foo", func(_ *stan.Msg) {}); err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	// Close the client connection
+	sc.Close()
+	nc.Close()
+	// Make sure connection close is correctly processed.
+	waitForNumClients(t, s, 0)
+}
+
+func TestAckSubsSubjectsInPoolUseUniqueSubject(t *testing.T) {
+	opts := GetDefaultOptions()
+	opts.ID = clusterName
+	opts.AckSubsPoolSize = 1
+	s1 := RunServerWithOpts(opts, nil)
+	defer s1.Shutdown()
+
+	opts.NATSServerURL = nats.DefaultURL
+	opts.ID = "otherCluster"
+	s2 := RunServerWithOpts(opts, nil)
+	defer s2.Shutdown()
+
+	sc1 := NewDefaultConnection(t)
+	defer sc1.Close()
+
+	if _, err := sc1.Subscribe("foo", func(m *stan.Msg) {}); err != nil {
+		t.Fatalf("Unexpected error on subscribe: %v", err)
+	}
+
+	sc2, err := stan.Connect("otherCluster", "otherClient")
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer sc2.Close()
+
+	// Create a subscription with manual ack, and ack after message is
+	// redelivered.
+	cb := func(m *stan.Msg) {
+		if m.Redelivered {
+			m.Ack()
+		}
+	}
+	if _, err := sc2.Subscribe("foo", cb,
+		stan.SetManualAckMode(),
+		stan.AckWait(time.Second)); err != nil {
+		t.Fatalf("Unexpected error on subscribe: %v", err)
+	}
+
+	// Produce 1 message for each connection
+	if err := sc1.Publish("foo", []byte("hello s1")); err != nil {
+		t.Fatalf("Unexpected error on publish: %v", err)
+	}
+	if err := sc2.Publish("foo", []byte("hello s2")); err != nil {
+		t.Fatalf("Unexpected error on publish: %v", err)
+	}
+
+	// Wait for ack of sc2 to be processed by s2
+	waitForAcks(t, s2, "otherClient", 1, 0)
+
+	s1.Lock()
+	s1AcksReceived, _ := s1.acksSubs[0].Delivered()
+	s1.Unlock()
+	if s1AcksReceived != 1 {
+		t.Fatalf("Expected pooled ack sub to receive only 1 message, got %v", s1AcksReceived)
+	}
+	s2.Lock()
+	s2AcksReceived, _ := s2.acksSubs[0].Delivered()
+	s2.Unlock()
+	if s2AcksReceived != 1 {
+		t.Fatalf("Expected pooled ack sub to receive only 1 message, got %v", s2AcksReceived)
+	}
 }

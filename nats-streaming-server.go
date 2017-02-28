@@ -34,6 +34,7 @@ Streaming Server Options:
     -hbi, --hb_interval <duration>   Interval at which server sends heartbeat to a client
     -hbt, --hb_timeout <duration>    How long server waits for a heartbeat response
     -hbf, --hb_fail_count <number>   Number of failed heartbeats before server closes the client connection
+          --ack_subs <number>        Number of internal subscriptions handling incoming ACKs (0 means one per client's subscription)
 
 Streaming Server File Store Options:
     --file_compact_enabled           Enable file compaction
@@ -48,6 +49,7 @@ Streaming Server File Store Options:
     --file_slice_max_bytes           Maximum file slice size - including index file (subject to channel limits)
     --file_slice_max_age             Maximum file slice duration starting when the first message is stored (subject to channel limits)
     --file_slice_archive_script      Path to script to use if you want to archive a file slice being removed
+    --file_fds_limit                 Store will try to use no more file descriptors than this given limit
 
 Streaming Server TLS Options:
     -secure                          Use a TLS connection to the NATS server without
@@ -173,6 +175,7 @@ func parseFlags() (*stand.Options, *natsd.Options) {
 	flag.String("ns", "", "NATSServerURL")
 	flag.StringVar(&stanConfigFile, "sc", "", "")
 	flag.StringVar(&stanConfigFile, "stan_config", "", "")
+	flag.Int("ack_subs", 0, "AckSubsPoolSize")
 	flag.Bool("file_compact_enabled", stores.DefaultFileStoreOptions.CompactEnabled, "FileStoreOpts.CompactEnabled")
 	flag.Int("file_compact_frag", stores.DefaultFileStoreOptions.CompactFragmentation, "FileStoreOpts.CompactFragmentation")
 	flag.Int("file_compact_interval", stores.DefaultFileStoreOptions.CompactInterval, "FileStoreOpts.CompactInterval")
@@ -185,6 +188,7 @@ func parseFlags() (*stand.Options, *natsd.Options) {
 	flag.Int64("file_slice_max_bytes", stores.DefaultFileStoreOptions.SliceMaxBytes, "FileStoreOpts.SliceMaxBytes")
 	flag.String("file_slice_max_age", "0s", "FileStoreOpts.SliceMaxAge")
 	flag.String("file_slice_archive_script", "", "FileStoreOpts.SliceArchiveScript")
+	flag.Int64("file_fds_limit", stores.DefaultFileStoreOptions.FileDescriptorsLimit, "FileStoreOpts.FileDescriptorsLimit")
 	flag.Int("io_batch_size", stand.DefaultIOBatchSize, "IOBatchSize")
 	flag.Int64("io_sleep_time", stand.DefaultIOSleepTime, "IOSleepTime")
 
@@ -245,7 +249,9 @@ func parseFlags() (*stand.Options, *natsd.Options) {
 	flag.StringVar(&natsOpts.TLSKey, "tlskey", "", "")
 	flag.StringVar(&natsOpts.TLSCaCert, "tlscacert", "", "")
 
-	flag.Usage = usage
+	flag.Usage = func() {
+		fmt.Printf("%s\n", usageStr)
+	}
 	flag.Parse()
 
 	// Show version and exit

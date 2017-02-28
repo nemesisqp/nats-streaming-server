@@ -1,4 +1,4 @@
-// Copyright 2016 Apcera Inc. All rights reserved.
+// Copyright 2016-2017 Apcera Inc. All rights reserved.
 
 package stores
 
@@ -48,7 +48,7 @@ func stackFatalf(t tLogger, f string, args ...interface{}) {
 	// Generate the Stack of callers:
 	for i := 1; true; i++ {
 		_, file, line, ok := runtime.Caller(i)
-		if ok == false {
+		if !ok {
 			break
 		}
 		msg := fmt.Sprintf("%d - %s:%d", i, file, line)
@@ -612,6 +612,19 @@ func testBasicSubStore(t *testing.T, s Store) {
 }
 
 func testGetSeqFromStartTime(t *testing.T, s Store) {
+	// Force creation of channel without storing anything yet
+	s.CreateChannel("foo", nil)
+	// Lookup channel store
+	cs := s.LookupChannel("foo")
+	if cs == nil {
+		t.Fatal("Channel foo should exist")
+	}
+	// Check before storing anything
+	seq := cs.Msgs.GetSequenceFromTimestamp(time.Now().UnixNano())
+	if seq != 0 {
+		t.Fatalf("Invalid start sequence. Expected %v got %v", 0, seq)
+	}
+
 	count := 100
 	msgs := make([]*pb.MsgProto, 0, count)
 	payload := []byte("hello")
@@ -621,14 +634,18 @@ func testGetSeqFromStartTime(t *testing.T, s Store) {
 		time.Sleep(1 * time.Millisecond)
 	}
 
-	cs := s.LookupChannel("foo")
-	if cs == nil {
-		t.Fatal("Channel foo should exist")
-	}
 	startMsg := msgs[count/2]
-	seq := cs.Msgs.GetSequenceFromTimestamp(startMsg.Timestamp)
+	seq = cs.Msgs.GetSequenceFromTimestamp(startMsg.Timestamp)
 	if seq != startMsg.Sequence {
 		t.Fatalf("Invalid start sequence. Expected %v got %v", startMsg.Sequence, seq)
+	}
+	seq = cs.Msgs.GetSequenceFromTimestamp(msgs[0].Timestamp - int64(time.Second))
+	if seq != msgs[0].Sequence {
+		t.Fatalf("Expected seq to be %v, got %v", msgs[0].Sequence, seq)
+	}
+	seq = cs.Msgs.GetSequenceFromTimestamp(msgs[count-1].Timestamp + int64(time.Second))
+	if seq != msgs[count-1].Sequence+1 {
+		t.Fatalf("Expected seq to be %v, got %v", msgs[count-1].Sequence+1, seq)
 	}
 }
 

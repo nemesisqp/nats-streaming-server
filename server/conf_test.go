@@ -95,6 +95,9 @@ func TestParseConfig(t *testing.T) {
 	if opts.FileStoreOpts.SliceArchiveScript != "myArchiveScript" {
 		t.Fatalf("Expected SliceArchiveScript to be myArchiveScript, got %v", opts.FileStoreOpts.SliceArchiveScript)
 	}
+	if opts.FileStoreOpts.FileDescriptorsLimit != 8 {
+		t.Fatalf("Expected FileDescriptorsLimit to be 8, got %v", opts.FileStoreOpts.FileDescriptorsLimit)
+	}
 	if opts.MaxChannels != 11 {
 		t.Fatalf("Expected MaxChannels to be 11, got %v", opts.MaxChannels)
 	}
@@ -154,6 +157,9 @@ func TestParseConfig(t *testing.T) {
 	if opts.ClientHBFailCount != 2 {
 		t.Fatalf("Expected ClientHBFailCount to be 2, got %v", opts.ClientHBFailCount)
 	}
+	if opts.AckSubsPoolSize != 3 {
+		t.Fatalf("Expected AckSubscriptions to be 3, got %v", opts.AckSubsPoolSize)
+	}
 }
 
 func TestParsePermError(t *testing.T) {
@@ -165,6 +171,9 @@ func TestParsePermError(t *testing.T) {
 		t.Fatalf("Could not create tmp dir: %v", err)
 	}
 	file, err := ioutil.TempFile(tmpDir, "config.conf")
+	if err != nil {
+		t.Fatalf("Could not create tmp file: %v", err)
+	}
 	os.Chmod(tmpDir, 0400)
 
 	defer file.Close()
@@ -239,6 +248,7 @@ func TestParseWrongTypes(t *testing.T) {
 	expectFailureFor(t, "hb_timeout: 123", wrongTypeErr)
 	expectFailureFor(t, "hb_timeout: \"foo\"", wrongTimeErr)
 	expectFailureFor(t, "hb_fail_count: false", wrongTypeErr)
+	expectFailureFor(t, "ack_subs_pool_size: false", wrongTypeErr)
 	expectFailureFor(t, "store_limits:{max_channels:false}", wrongTypeErr)
 	expectFailureFor(t, "store_limits:{max_msgs:false}", wrongTypeErr)
 	expectFailureFor(t, "store_limits:{max_bytes:false}", wrongTypeErr)
@@ -266,6 +276,7 @@ func TestParseWrongTypes(t *testing.T) {
 	expectFailureFor(t, "file:{slice_max_age:123}", wrongTypeErr)
 	expectFailureFor(t, "file:{slice_max_age:\"1h:0m\"}", wrongTimeErr)
 	expectFailureFor(t, "file:{slice_archive_script:123}", wrongTypeErr)
+	expectFailureFor(t, "file:{fds_limit:false}", wrongTypeErr)
 }
 
 func expectFailureFor(t *testing.T, content, errorMatch string) {

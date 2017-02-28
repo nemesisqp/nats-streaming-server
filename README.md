@@ -67,6 +67,7 @@ Streaming Server Options:
     -hbi, --hb_interval <duration>   Interval at which server sends heartbeat to a client
     -hbt, --hb_timeout <duration>    How long server waits for a heartbeat response
     -hbf, --hb_fail_count <number>   Number of failed heartbeats before server closes the client connection
+          --ack_subs <number>        Number of internal subscriptions handling incoming ACKs (0 means one per client's subscription)
 
 Streaming Server File Store Options:
     --file_compact_enabled           Enable file compaction
@@ -198,6 +199,14 @@ hb_timeout: "10s"
 # Can be hbf, hb_fail_count, server_to_client_hb_fail_count
 hb_fail_count: 2
 
+# Normally, when a client creates a subscription, the server creates
+# an internal subscription to receive its ACKs.
+# If lots of subscriptions are created, the number of internal
+# subscriptions in the server could be very high. To curb this growth,
+# use this parameter to configure a pool of internal ACKs subscriptions.
+# Can be ack_subs_pool_size, ack_subscriptions_pool_size
+ack_subs_pool_size: 10
+
 # Define store limits.
 # Can be limits, store_limits or StoreLimits.
 # See Store Limits chapter below for more details.
@@ -295,6 +304,17 @@ file: {
     # files.
     # Can be slice_archive_script, slice_archive, slice_script
     slice_archive_script: "/home/nats-streaming/archive/script.sh"
+
+    # Channels translate to sub-directories under the file store's root
+    # directory. Each channel needs several files to maintain the state
+    # so the need for file descriptors increase with the number of
+    # channels. This option instructs the store to limit the concurrent
+    # use of file descriptors. Note that this is a soft limit and there
+    # may be cases when the store will use more than this number.
+    # A value of 0 means no limit. Setting a limit will probably have
+    # a performance impact.
+    # Can be file_descriptors_limit, fds_limit
+    fds_limit: 100
 }
 ```
 
@@ -501,6 +521,13 @@ and you have configured the script `/home/nats-streaming/archive_script.sh`. The
 Notice how the files have been renamed with the `.bak` extension so that they are not going to be recovered if
 the script leave those files in place.
 
+As previously described, each channel corresponds to a sub-directory that contains several files. It means that the need
+for file descriptors increase with the number of channels. In order to scale to ten or hundred thousands of channels,
+the option `fds_limit` (or command line parameter `--file_fds_limit`) may be considered to limit the total use of file descriptors.
+
+Note that this is a soft limit. It is possible for the store to use more file descriptors than the given limit if the
+number of concurrent read/writes to different channels is more than the said limit. It is also understood that this
+may affect performance since files may need to be closed/re-opened as needed.
 
 ### Store Interface
 
@@ -564,7 +591,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 
 [License-Url]: http://opensource.org/licenses/MIT
-[License-Image]: https://img.shields.io/npm/l/express.svg
+[License-Image]: https://img.shields.io/badge/License-MIT-blue.svg
 [Build-Status-Url]: http://travis-ci.org/nats-io/nats-streaming-server
 [Build-Status-Image]: https://travis-ci.org/nats-io/nats-streaming-server.svg?branch=master
 [Coverage-Url]: https://coveralls.io/r/nats-io/nats-streaming-server?branch=master
