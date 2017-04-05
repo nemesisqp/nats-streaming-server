@@ -11,7 +11,260 @@ NATS Streaming provides the following high-level feature set.
 - Replay/Restart
 - Last Value Semantics
 
-### Getting Started
+# Table of Contents
+
+- [Important Changes](#important-changes)
+- [Concepts](#concepts)
+    * [Relation to NATS](#relation-to-nats)
+    * [Client Connections](#client-connections)
+    * [Channels](#channels)
+        * [Message Log](#message-log)
+        * [Subscriptions](#subscriptions)
+            * [Regular](#regular)
+            * [Durable](#durable)
+            * [Queue Group](#queue-group)
+            * [Redelivery](#redelivery)
+    * [Store Interface](#store-interface)
+    * [Clustering](#clustering)
+    * [Fault Tolerance](#fault-tolerance)
+        * [Active Server](#active-server)
+        * [Standby Servers](#standby-servers)
+        * [Shared State](#shared-state)
+        * [Failover](#failover)
+- [Getting Started](#getting-started)
+    * [Building](#building)
+    * [Running](#running)
+- [Configuring](#configuring)
+    * [Command line arguments](#command-line-arguments)
+    * [Configuration file](#configuration-file)
+    * [Store Limits](#store-limits)
+        * [Limits inheritance](#limits-inheritance)
+    * [Securing](#securing)
+        * [Authorization](#authorization)
+        * [TLS](#tls)
+    * [Persistence](#persistence)
+        * [File Store](#file-store)
+            * [File Store Options](#file-store-options)
+- [Clients](#clients)
+- [Licence](#license)
+
+# Important Changes
+
+## Version `0.4.0`
+
+The Store interface was updated. There are 2 news APIs:
+
+* `Recover()`: The recovery of persistent state was previously done in the constructor of the store implementation.<br>
+It is now separate and specified with this API. The server will first instantiate the store, in
+which some initialization or checks can be made.<br>
+If no error is reported, the server will then proceed with calling `Recover()`, which will returned the recovered state.<br>
+* `GetExclusiveLock()`: In Fault Tolerance mode, when a server is elected leader, it will attempt to get an exclusive
+lock to the shared storage before proceeding.<br>
+
+Check the [Store interface](https://github.com/nats-io/nats-streaming-server/blob/master/stores/store.go) for more information.
+
+# Concepts
+
+## Relation to NATS
+
+NATS Streaming Server by default embeds a [NATS](https://github.com/nats-io/gnatsd) server. That is, the Streaming server is not a server per-se, but instead, a client to a NATS Server.<br>
+It means that Streaming clients are not directly connected to the streaming server, but instead communicate with the streaming server *through* NATS Server.
+
+This detail is important when it comes to Streaming clients connections to the Streaming server. Indeed, since there is no direct
+connection, the server knows if a client is connected based on heartbeats.
+
+***It is therefore strongly recommended for clients to close their connection when the application exit, otherwise the server
+will consider these clients connected (sending data, etc...) until it detects missing hearbeats.***
+
+The streaming server creates internal subscriptions on specific subjects to communicate with its clients and/or other servers.
+
+Note that NATS clients and NATS Streaming clients cannot exchange data between each other. That is, if a streaming client
+publishes on `foo`, a NATS client subscribing on that same subject will not receive the messages. Streaming messages are NATS
+messages made of a protobuf. The streaming server is expected to send ACKs back to producers and receive ACKs from consumers.
+If messages were freely exchanged with the NATS clients, this would cause problems.
+
+## Client Connections
+
+As described, clients are not directly connected to the streaming server. Instead, they send connection requests. The request
+includes a `client ID` which is used by the server to uniquely identify, and restrict, a given client. That is, no two
+connections with the same client ID will be able to run concurrently.
+
+This client ID links a given connection to its published messages, subscriptions, especially durable subscriptions. Indeed, durable
+subscriptions are stored as a combination of the client ID and durable name. More on durable subscriptions later.
+
+It is also used to resolve the issue of not having direct client connections to the server. For instance, say that a client crashes
+without closing the connection. It later restarts with the same client ID. The server will detect that this client ID is already
+in-use. It will try to contact that known client to its original private inbox. If the server does not receive a response - which
+would be the case if the client crashed - it will replace the old client with this new one.<br>
+Otherwise, the server would reject the connection request since the client ID is already in-use.
+
+## Channels
+
+Channels are at the heart of the NATS Streaming Server. Channels are subjects clients send data to and consume from.
+
+***Note: NATS Streaming server does not support wildcard for channels, that is, one cannot subscribe on `foo.*`, or `>`, etc...***
+
+The number of channels can be limited (and is by default) through configuration. Messages produced to a channel are stored
+in a message log inside this channel.
+
+### Message Log
+
+You can view a message log as a ring buffer. Messages are appended to the end of the log. If a limit is set gobally for all channels, or specifically for this channel, when the limit is reached, older messages are removed to make room for the new ones.
+
+But except for the administrative size/age limit set for a message log, messages are not removed due to consumers consuming them.
+In fact, messages are stored regardless of the presence of subscriptions on that channel.
+
+### Subscriptions
+
+A client creates a subscription on a given channel. Remember, there is no support for wildcards, so a subscription is really tied to
+one and only one channel. The server will maintain the subscription state on behalf of the client until the later closes the subscription (or its connection).
+
+If there are messages in the log for this channel, messages will be sent to the consumer when the subscription is created. The server will
+send up to the maximum number of inflight messages as given by the client when creating the subscription.
+
+When receiving ACKs from the consumer, the server will then deliver more messages, if more are available.
+
+A subscription can be created to start at any point in the message log, either by message sequence, or by time.
+
+There are several type of subscriptions:
+
+#### Regular
+
+The state of these subscriptions is removed when they are unsubscribed or closed (which is equivalent for this type of subscription) or
+the client connection is closed (explicitly by the client, or closed by the server due to timeout). They do, however, survive a *server*
+failure (if running with a persistent store).
+
+#### Durable
+
+If an application wishes to resume message consumption from where it previously stopped, it needs to create a durable subscription.
+It does so by providing a durable name, which is combined with the client ID provided when the client created its connection. The server then
+maintain the state for this subscription even after the client connection is closed.
+
+***Note: The starting position given by the client when restarting a durable subscription is ignored.***
+
+When the application wants to stop receving messages on a durable subscription, it should close - but *not unsubscribe*- this subscription.
+If a given client library does not have the option to close a subscription, the application should close the connection instead.
+
+When the application wants to delete the subscription, it must unsubscribe it. Once unsubscribed, the state is removed and it is then
+possible to re-use the durable name, but it will be considered a brand new durable subscription, with the start position being the one
+given by the client when creating the durable subscription.
+
+#### Queue Group
+
+When consumers want to consume from the same channel but each receive a different message, as opposed to all receiving the same messages,
+they need to create a queue subscription. When a queue group name is specified, the server will send each messages from the log to a single
+consumer in the group. The distribution of these messages is not specified, therefore applications should not rely on an expected delivery
+scheme.
+
+After the first queue member is created, any other member joining the group will receive messages based on where the server is in the message log for that particular group. That means that starting position given by joining members is ignored by the server.
+
+When the last member of the group leaves (subscription unsubscribed/closed/or connection closed), the group is removed from the server.
+The next application creating a subscription with the same name will create a new group, starting at the start position given in the subscription request.
+
+Queue subscriptions can also be durables. In this case, the client provides also a durable name. The behavior is, as you would expect,
+a combination of queue and durable subscriptions. The main difference is that when the last member leaves the group, the state of
+the group will be maintained by the server. Later, when a member rejoins the group, the delivery will resume.
+
+***Note: For a durable queue subscription, the last member to * unsubscribe * (not simply close) causes the group to  be removed from the server.***
+
+#### Redelivery
+
+When the server sends a message to a consumer, it expects to receive an ACK from this consumer. The consumer is the one specifying
+how long the server should wait before resending all unacknowledged messages to the consumer.
+
+When the server restarts and recovers unacknowledged messages for a subscription, it will first attempt to redelivery those
+messages before sending new messages. However, if during the initial redelivery some messages don't make it to the client,
+the server cannot know that and will enable delivery of new messages.
+
+***So it is possible for an application to receive redelivered messages mixed with new messages. This is typically what happens
+outside of the server restart scenario.***
+
+For queue subscriptions, if a member has unacknowledged messages, when this member `AckWait` (which is the duration given to the
+server before the server should attempt to redeliver unacknowledged messages) time elapses, the messages are redelivered to any
+other member in the group (including itself).
+
+If a queue member leaves the group, its unacknowledged messages are redistributed to other queue members.
+
+## Store Interface
+
+Every store implementation follows the [Store interface](https://github.com/nats-io/nats-streaming-server/blob/master/stores/store.go).
+
+On startup, the server creates a unique instance of the `Store`. The constructor of a store implementation can do some
+initialization and configuration check, but *must not* access, or attempt to recover, the storage at this point. This is important
+because when the server runs on Fault Tolerance mode, the storage must be shared across many servers but only one server can be
+using it.
+
+After instantiating the store, the server will then call `Recover()` in order to recover the persisted state. For implementations
+that do not support persitence, such as the provided `MemoryStore`, this call will simply return `nil` (without error) to
+indicate that no state was recovered.
+
+The `Store` is used to add/delete clients, create/lookup channels, etc...
+
+Creating/looking up a channel will return a `ChannelStore`, which points to two other interfaces, the `SubStore` and `MsgStore`. These stores, for a given channel, handle subscriptions and messages respectively.
+
+If you wish to contribute to a new store type, your implementation must include all these interfaces. For stores that allow recovery (such as file store as opposed to memory store), there are additional structures that have been defined and should be returned by `Recover()`.
+
+The memory and the provided file store implementations both use a generic store implementation to avoid code duplication.
+When writing your own store implementation, you can do the same for APIs that don't need to do more than what the generic implementation provides.
+You can check [MemStore](https://github.com/nats-io/nats-streaming-server/blob/master/stores/memstore.go) and [FileStore](https://github.com/nats-io/nats-streaming-server/blob/master/stores/filestore.go) implementations for more details.
+
+## Clustering
+
+NATS Streaming Server does not support clustering at this time. The confusion is that it can run with a cluster of NATS Servers,
+but as previously explained, the NATS Servers are the backbone of the streaming systems. So it is possible to run a single
+streaming server attached to a cluster of NATS Servers and streaming clients attached to any of the NATS Server in the NATS cluster.
+
+Streaming clustering with full replication of data across a set of streaming servers is planned for later this year.
+
+## Fault Tolerance
+
+To minimize the single point of failure, NATS Streaming server can be run in Fault Tolerance mode. It works by having a group
+of servers with one acting as the active server (accessing the store) and handling all communication with clients, and all others
+acting as standby servers.
+
+To start a server in Fault Tolerance (FT) mode, you specify an FT group name. This is so that in the future, one could have
+different FT groups for servers with the same cluster ID. For now, use it to simply enable Fault Tolerance mode.
+
+Here is an example on how starting 2 servers in FT mode running on the same host and embedding the NATS servers:
+
+```
+nats-streaming-server -store file -dir datastore -ft_group "ft" -cluster nats://localhost:6222 -routes nats://localhost:6223 -p 4222
+
+nats-streaming-server -store file -dir datastore -ft_group "ft" -cluster nats://localhost:6223 -routes nats://localhost:6222 -p 4223
+```
+
+### Active Server
+
+There is a single Active server in the group. This server was the first to obtain the exclusive lock for storage.
+For the `FileStore` implementation, it means trying to get an advisory lock for a file located in the shared datastore. If the
+elected server fails to grab this lock because it is already locked, it will go back to standby.
+
+***Only the active server accesses the store and service all clients.***
+
+### Standby servers
+
+There can be as many as you want standby servers on the same group. These servers do not access the store and do not receive any data from the streaming clients. They are just running waiting for the detectiong of the active server failure.
+
+### Shared State
+
+Actual file replication to multiple disks is not handled by the Streaming server. This - if required - needs to be handled by the user. For the FileStore implementation that we currently provide, the data store needs to be mounted by all servers in the FT group (e.g. an NFS Mount (Gluster in Google Cloud or EFS in Amazon).
+
+### Failover
+
+When the active server fails, all standby servers will try to activate. The process consists of trying to get an exclusive lock
+on the storage.
+
+The first server that succeeds will become active and go through the process of recovering the store and service clients.
+It is as if a server in standalone mode was automatically restarted.
+
+All other servers that failed to get the store lock will go back to standby mode and stay in this mode until they stop
+receiving heartbeats from the current active server.
+
+It is possible that a standby trying to activate is not able to immediately acquire the store lock. When that happens,
+it goes back into standby mode, but if it fails to receive heartbeats from an active server, it will try again to
+acquire the store lock. The interval is random but as of now set to a bit more than a second.
+
+# Getting Started
 
 The best way to get the NATS Streaming Server is to use one of the pre-built release binaries which are available for OSX, Linux (x86-64/ARM), Windows. Instructions for using these binaries are on the GitHub releases page.
 
@@ -19,115 +272,140 @@ Of course you can build the latest version of the server from the master branch.
 
 See also the NATS Streaming Quickstart [tutorial](https://nats.io/documentation/streaming/nats-streaming-quickstart/).
 
-### Running
+## Building
+
+Building the NATS Streaming Server from source requires at least version 1.6 of Go, but we encourage the use of the latest stable release. Information on installation, including pre-built binaries, is available at http://golang.org/doc/install. Stable branches of operating system packagers provided by your OS vendor may not be sufficient.
+
+Run `go version` to see the version of Go which you have installed.
+
+Run `go build` inside the directory to build.
+
+Run `go test ./...` to run the unit regression tests.
+
+A successful build produces no messages and creates an executable called `nats-streaming-server` in the current directory. You can invoke that binary, with no options and no configuration file, to start a server with acceptable standalone defaults (no authentication, memory store).
+
+Run go help for more guidance, and visit http://golang.org/ for tutorials, presentations, references and more.
+
+## Running
 
 The NATS Streaming Server embeds a NATS Server. Starting the server with no argument will give you a server with default settings and a memory based store.
 
 ```
 > ./nats-streaming-server
-[79856] 2017/01/17 16:25:30.111311 [INF] Starting nats-streaming-server[test-cluster] version 0.3.8
-[79856] 2017/01/17 16:25:30.111620 [INF] Starting nats-server version 0.9.6
-[79856] 2017/01/17 16:25:30.111632 [INF] Listening for client connections on 0.0.0.0:4222
-[79856] 2017/01/17 16:25:30.111706 [INF] Server is ready
-[79856] 2017/01/17 16:25:30.395811 [INF] STAN: Message store is MEMORY
-[79856] 2017/01/17 16:25:30.395828 [INF] STAN: --------- Store Limits ---------
-[79856] 2017/01/17 16:25:30.395836 [INF] STAN: Channels:                  100 *
-[79856] 2017/01/17 16:25:30.395840 [INF] STAN: -------- channels limits -------
-[79856] 2017/01/17 16:25:30.395845 [INF] STAN:   Subscriptions:          1000 *
-[79856] 2017/01/17 16:25:30.395850 [INF] STAN:   Messages     :       1000000 *
-[79856] 2017/01/17 16:25:30.395873 [INF] STAN:   Bytes        :     976.56 MB *
-[79856] 2017/01/17 16:25:30.395878 [INF] STAN:   Age          :     unlimited *
-[79856] 2017/01/17 16:25:30.395881 [INF] STAN: --------------------------------
+[59824] 2017/04/01 10:24:31.361848 [INF] STREAM: Starting nats-streaming-server[test-cluster] version 0.4.0
+[59824] 2017/04/01 10:24:31.361925 [INF] STREAM: ServerID: x2KSRErzlqdQZDURmWPOYw
+[59824] 2017/04/01 10:24:31.362084 [INF] Starting nats-server version 0.9.6
+[59824] 2017/04/01 10:24:31.362095 [INF] Listening for client connections on 0.0.0.0:4222
+[59824] 2017/04/01 10:24:31.362158 [INF] Server is ready
+[59824] 2017/04/01 10:24:31.645747 [INF] STREAM: Message store is MEMORY
+[59824] 2017/04/01 10:24:31.645765 [INF] STREAM: --------- Store Limits ---------
+[59824] 2017/04/01 10:24:31.645772 [INF] STREAM: Channels:                  100 *
+[59824] 2017/04/01 10:24:31.645776 [INF] STREAM: -------- channels limits -------
+[59824] 2017/04/01 10:24:31.645781 [INF] STREAM:   Subscriptions:          1000 *
+[59824] 2017/04/01 10:24:31.645788 [INF] STREAM:   Messages     :       1000000 *
+[59824] 2017/04/01 10:24:31.645808 [INF] STREAM:   Bytes        :     976.56 MB *
+[59824] 2017/04/01 10:24:31.645813 [INF] STREAM:   Age          :     unlimited *
+[59824] 2017/04/01 10:24:31.645817 [INF] STREAM: --------------------------------
 ```
 
 The server will be started and listening for client connections on port 4222 (the default) from all available interfaces. The logs will be displayed to stderr as shown above.
 
 Note that you do not need to start the embedded NATS Server. It is started automatically when you run the NATS Streaming Server. See below for details on how you secure the embedded NATS Server.
 
-## Configuring
+# Configuring
 
-### Command line arguments
+## Command line arguments
 
 The NATS Streaming Server accepts command line arguments to control its behavior. There is a set of parameters specific to the NATS Streaming Server and some to the embedded NATS Server.
+
+***Note about parameters types***
+
+| Type | Remark |
+|:----|:----|
+|`<bool>`| For booleans, either simply specify the parameter with value to enable (e.g `-SD`), or specify `=false` to disable|
+|`<size>` | You can specify as a number `1024` or as a size `1KB`|
+|`<duration>` | Values must be expressed in the form `_h_m_s`, such as `1h` or `20s` or `1h30m`, or `1.5h`, etc...|
 
 ```
 Usage: nats-streaming-server [options]
 
 Streaming Server Options:
-    -cid, --cluster_id  <cluster ID> Cluster ID (default: test-cluster)
-    -st,  --store <type>             Store type: MEMORY|FILE (default: MEMORY)
-          --dir <directory>          For FILE store type, this is the root directory
-    -mc,  --max_channels <number>    Max number of channels (0 for unlimited)
-    -msu, --max_subs <number>        Max number of subscriptions per channel (0 for unlimited)
-    -mm,  --max_msgs <number>        Max number of messages per channel (0 for unlimited)
-    -mb,  --max_bytes <number>       Max messages total size per channel (0 for unlimited)
-    -ma,  --max_age <seconds>        Max duration a message can be stored ("0s" for unlimited)
-    -ns,  --nats_server <url>        Connect to this external NATS Server (embedded otherwise)
-    -sc,  --stan_config <file>       Streaming server configuration file
+    -cid, --cluster_id  <string>     Cluster ID (default: test-cluster)
+    -st,  --store <string>           Store type: MEMORY|FILE (default: MEMORY)
+          --dir <string>             For FILE store type, this is the root directory
+    -mc,  --max_channels <int>       Max number of channels (0 for unlimited)
+    -msu, --max_subs <int>           Max number of subscriptions per channel (0 for unlimited)
+    -mm,  --max_msgs <int>           Max number of messages per channel (0 for unlimited)
+    -mb,  --max_bytes <size>         Max messages total size per channel (0 for unlimited)
+    -ma,  --max_age <duration>       Max duration a message can be stored ("0s" for unlimited)
+    -ns,  --nats_server <string>     Connect to this external NATS Server URL (embedded otherwise)
+    -sc,  --stan_config <string>     Streaming server configuration file
     -hbi, --hb_interval <duration>   Interval at which server sends heartbeat to a client
     -hbt, --hb_timeout <duration>    How long server waits for a heartbeat response
-    -hbf, --hb_fail_count <number>   Number of failed heartbeats before server closes the client connection
-          --ack_subs <number>        Number of internal subscriptions handling incoming ACKs (0 means one per client's subscription)
+    -hbf, --hb_fail_count <int>      Number of failed heartbeats before server closes the client connection
+          --ack_subs <int>           Number of internal subscriptions handling incoming ACKs (0 means one per client's subscription)
+          --ft_group <string>        Name of the FT Group. A group can be 2 or more servers with a single active server and all sharing the same datastore.
 
 Streaming Server File Store Options:
-    --file_compact_enabled           Enable file compaction
-    --file_compact_frag              File fragmentation threshold for compaction
-    --file_compact_interval <int>    Minimum interval (in seconds) between file compactions
-    --file_compact_min_size <int>    Minimum file size for compaction
-    --file_buffer_size <int>         File buffer size (in bytes)
-    --file_crc                       Enable file CRC-32 checksum
-    --file_crc_poly <int>            Polynomial used to make the table used for CRC-32 checksum
-    --file_sync                      Enable File.Sync on Flush
-    --file_slice_max_msgs            Maximum number of messages per file slice (subject to channel limits)
-    --file_slice_max_bytes           Maximum file slice size - including index file (subject to channel limits)
-    --file_slice_max_age             Maximum file slice duration starting when the first message is stored (subject to channel limits)
-    --file_slice_archive_script      Path to script to use if you want to archive a file slice being removed
+    --file_compact_enabled <bool>        Enable file compaction
+    --file_compact_frag <int>            File fragmentation threshold for compaction
+    --file_compact_interval <int>        Minimum interval (in seconds) between file compactions
+    --file_compact_min_size <size>       Minimum file size for compaction
+    --file_buffer_size <size>            File buffer size (in bytes)
+    --file_crc <bool>                    Enable file CRC-32 checksum
+    --file_crc_poly <int>                Polynomial used to make the table used for CRC-32 checksum
+    --file_sync <bool>                   Enable File.Sync on Flush
+    --file_slice_max_msgs <int>          Maximum number of messages per file slice (subject to channel limits)
+    --file_slice_max_bytes <size>        Maximum file slice size - including index file (subject to channel limits)
+    --file_slice_max_age <duration>      Maximum file slice duration starting when the first message is stored (subject to channel limits)
+    --file_slice_archive_script <string> Path to script to use if you want to archive a file slice being removed
+    --file_fds_limit <int>               Store will try to use no more file descriptors than this given limit
 
 Streaming Server TLS Options:
-    -secure                          Use a TLS connection to the NATS server without
+    -secure <bool>                   Use a TLS connection to the NATS server without
                                      verification; weaker than specifying certificates.
-    -tls_client_key                  Client key for the streaming server
-    -tls_client_cert                 Client certificate for the streaming server
-    -tls_client_cacert               Client certificate CA for the streaming server
+    -tls_client_key <string>         Client key for the streaming server
+    -tls_client_cert <string>        Client certificate for the streaming server
+    -tls_client_cacert <string>      Client certificate CA for the streaming server
 
 Streaming Server Logging Options:
-    -SD, --stan_debug                Enable STAN debugging output
-    -SV, --stan_trace                Trace the raw STAN protocol
+    -SD, --stan_debug=<bool>         Enable STAN debugging output
+    -SV, --stan_trace=<bool>         Trace the raw STAN protocol
     -SDV                             Debug and trace STAN
     (See additional NATS logging options below)
 
 Embedded NATS Server Options:
-    -a, --addr <host>                Bind to host address (default: 0.0.0.0)
-    -p, --port <port>                Use port for clients (default: 4222)
-    -P, --pid <file>                 File to store PID
-    -m, --http_port <port>           Use port for http monitoring
-    -ms,--https_port <port>          Use port for https monitoring
-    -c, --config <file>              Configuration file
+    -a, --addr <string>              Bind to host address (default: 0.0.0.0)
+    -p, --port <int>                 Use port for clients (default: 4222)
+    -P, --pid <string>               File to store PID
+    -m, --http_port <int>            Use port for http monitoring
+    -ms,--https_port <int>           Use port for https monitoring
+    -c, --config <string>            Configuration file
 
 Logging Options:
-    -l, --log <file>                 File to redirect log output
-    -T, --logtime                    Timestamp log entries (default: true)
-    -s, --syslog                     Enable syslog as log method
-    -r, --remote_syslog <addr>       Syslog server addr (udp://localhost:514)
-    -D, --debug                      Enable debugging output
-    -V, --trace                      Trace the raw protocol
+    -l, --log <string>               File to redirect log output
+    -T, --logtime=<bool>             Timestamp log entries (default: true)
+    -s, --syslog <string>            Enable syslog as log method
+    -r, --remote_syslog <string>     Syslog server addr (udp://localhost:514)
+    -D, --debug=<bool>               Enable debugging output
+    -V, --trace=<bool>               Trace the raw protocol
     -DV                              Debug and trace
 
 Authorization Options:
-        --user <user>                User required for connections
-        --pass <password>            Password required for connections
-        --auth <token>               Authorization token required for connections
+        --user <string>              User required for connections
+        --pass <string>              Password required for connections
+        --auth <string>              Authorization token required for connections
 
 TLS Options:
-        --tls                        Enable TLS, do not verify clients (default: false)
-        --tlscert <file>             Server certificate file
-        --tlskey <file>              Private key for server certificate
-        --tlsverify                  Enable TLS, verify client certificates
-        --tlscacert <file>           Client certificate CA for verification
+        --tls=<bool>                 Enable TLS, do not verify clients (default: false)
+        --tlscert <string>           Server certificate file
+        --tlskey <string>            Private key for server certificate
+        --tlsverify=<bool>           Enable TLS, verify client certificates
+        --tlscacert <string>         Client certificate CA for verification
 
 NATS Clustering Options:
-        --routes <rurl-1, rurl-2>    Routes to solicit and connect
-        --cluster <cluster-url>      Cluster URL for solicited routes
+        --routes <string, ...>       Routes to solicit and connect
+        --cluster <string>           Cluster URL for solicited routes
 
 Common Options:
     -h, --help                       Show this message
@@ -135,7 +413,7 @@ Common Options:
         --help_tls                   TLS help.
 ```
 
-### Configuration file
+## Configuration file
 
 You can use a configuration file to configure the options specific to the NATS Streaming server.
 
@@ -206,6 +484,12 @@ hb_fail_count: 2
 # use this parameter to configure a pool of internal ACKs subscriptions.
 # Can be ack_subs_pool_size, ack_subscriptions_pool_size
 ack_subs_pool_size: 10
+
+# In Fault Tolerance mode, you can start a group of streaming servers
+# with only one server being active while others are running in standby
+# mode. The FT group is named.
+# Can be ft_group, ft_group_name
+ft_group: "ft"
 
 # Define store limits.
 # Can be limits, store_limits or StoreLimits.
@@ -318,7 +602,7 @@ file: {
 }
 ```
 
-### Store Limits
+## Store Limits
 
 The `store_limits` section in the configuration file (or the command line parameters
 `-mc`, `-mm`, etc..) allow you to configure the global limits.
@@ -374,28 +658,28 @@ limit to indicate that the limit was inherited (either from global or default li
 This is what would be displayed with the above store limits configuration:
 
 ```
-[53904] 2016/10/18 10:10:50.581799 [INF] STAN: --------- Store Limits ---------
-[53904] 2016/10/18 10:10:50.581807 [INF] STAN: Channels:                   10
-[53904] 2016/10/18 10:10:50.581810 [INF] STAN: -------- channels limits -------
-[53904] 2016/10/18 10:10:50.581816 [INF] STAN:   Subscriptions:          1000 *
-[53904] 2016/10/18 10:10:50.581821 [INF] STAN:   Messages     :         10000
-[53904] 2016/10/18 10:10:50.581846 [INF] STAN:   Bytes        :      10.00 MB
-[53904] 2016/10/18 10:10:50.581859 [INF] STAN:   Age          :        1h0m0s
-[53904] 2016/10/18 10:10:50.581867 [INF] STAN: Channel: "foo"
-[53904] 2016/10/18 10:10:50.581872 [INF] STAN:   Subscriptions:            50
-[53904] 2016/10/18 10:10:50.581877 [INF] STAN:   Messages     :           300
-[53904] 2016/10/18 10:10:50.581883 [INF] STAN:   Bytes        :      10.00 MB *
-[53904] 2016/10/18 10:10:50.581889 [INF] STAN:   Age          :        1h0m0s *
-[53904] 2016/10/18 10:10:50.581893 [INF] STAN: Channel: "bar"
-[53904] 2016/10/18 10:10:50.581897 [INF] STAN:   Subscriptions:          1000 *
-[53904] 2016/10/18 10:10:50.581902 [INF] STAN:   Messages     :            50
-[53904] 2016/10/18 10:10:50.581916 [INF] STAN:   Bytes        :        1000 B
-[53904] 2016/10/18 10:10:50.581926 [INF] STAN:   Age          :        1h0m0s *
-[53904] 2016/10/18 10:10:50.581930 [INF] STAN: --------------------------------
+[59872] 2017/04/01 10:25:18.747822 [INF] STREAM: --------- Store Limits ---------
+[59872] 2017/04/01 10:25:18.747830 [INF] STREAM: Channels:                   10
+[59872] 2017/04/01 10:25:18.747834 [INF] STREAM: -------- channels limits -------
+[59872] 2017/04/01 10:25:18.747839 [INF] STREAM:   Subscriptions:          1000 *
+[59872] 2017/04/01 10:25:18.747845 [INF] STREAM:   Messages     :         10000
+[59872] 2017/04/01 10:25:18.747863 [INF] STREAM:   Bytes        :      10.00 MB
+[59872] 2017/04/01 10:25:18.747887 [INF] STREAM:   Age          :        1h0m0s
+[59872] 2017/04/01 10:25:18.747904 [INF] STREAM: Channel: "foo"
+[59872] 2017/04/01 10:25:18.747908 [INF] STREAM:   Subscriptions:            50
+[59872] 2017/04/01 10:25:18.747924 [INF] STREAM:   Messages     :           300
+[59872] 2017/04/01 10:25:18.747927 [INF] STREAM:   Bytes        :      10.00 MB *
+[59872] 2017/04/01 10:25:18.747930 [INF] STREAM:   Age          :        1h0m0s *
+[59872] 2017/04/01 10:25:18.747932 [INF] STREAM: Channel: "bar"
+[59872] 2017/04/01 10:25:18.747935 [INF] STREAM:   Subscriptions:          1000 *
+[59872] 2017/04/01 10:25:18.747937 [INF] STREAM:   Messages     :            50
+[59872] 2017/04/01 10:25:18.747941 [INF] STREAM:   Bytes        :        1000 B
+[59872] 2017/04/01 10:25:18.747944 [INF] STREAM:   Age          :        1h0m0s *
+[59872] 2017/04/01 10:25:18.747946 [INF] STREAM: --------------------------------
 ```
 
 
-## Securing NATS Streaming Server
+## Securing
 
 ### Authorization
 
@@ -528,34 +812,6 @@ the option `fds_limit` (or command line parameter `--file_fds_limit`) may be con
 Note that this is a soft limit. It is possible for the store to use more file descriptors than the given limit if the
 number of concurrent read/writes to different channels is more than the said limit. It is also understood that this
 may affect performance since files may need to be closed/re-opened as needed.
-
-### Store Interface
-
-Every store implementation follows the [Store interface](https://github.com/nats-io/nats-streaming-server/blob/master/stores/store.go).
-
-The main interace is the `Store` which the server will create a unique instance of. From a store, the server can add/delete clients, create/lookup channels, etc...
-
-Creating/looking up a channel will return a `ChannelStore`, which points to two other interfaces, the `SubStore` and `MsgStore`. These stores handle, for a given channel, subscriptions and messages respectiverly.
-
-If you wish to contribute to a new store type, your implementation must include all these interfaces. For stores that allow recovery (such as file store as opposed to memory store), there are additional structures that have been defined and that a store constructor should return. This allows the server to reconstruct its state on startup.
-
-The memory and the provided file store implementations both use a generic store implementation to avoid code duplication.
-When writing your own store implementation, you can do the same for APIs that don't need to do more than what the generic implementation provides.
-You can check [MemStore](https://github.com/nats-io/nats-streaming-server/blob/master/stores/memstore.go) and [FileStore](https://github.com/nats-io/nats-streaming-server/blob/master/stores/filestore.go) implementations for more details.
-
-## Building
-
-Building the NATS Streaming Server from source requires at least version 1.6 of Go, but we encourage the use of the latest stable release. Information on installation, including pre-built binaries, is available at http://golang.org/doc/install. Stable branches of operating system packagers provided by your OS vendor may not be sufficient.
-
-Run `go version` to see the version of Go which you have installed.
-
-Run `go build` inside the directory to build.
-
-Run `go test ./...` to run the unit regression tests.
-
-A successful build produces no messages and creates an executable called `nats-streaming-server` in the current directory. You can invoke that binary, with no options and no configuration file, to start a server with acceptable standalone defaults (no authentication, memory store).
-
-Run go help for more guidance, and visit http://golang.org/ for tutorials, presentations, references and more.
 
 ## Clients
 

@@ -5,6 +5,7 @@ package util
 import (
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -154,7 +155,7 @@ func TestBackoffTimeCheck(t *testing.T) {
 	}
 	for i, f := range freqs {
 		dur := time.Duration(expected[i] * int64(time.Millisecond))
-		if f < dur-5*time.Millisecond || f > dur+5*time.Millisecond {
+		if f < dur-15*time.Millisecond || f > dur+15*time.Millisecond {
 			t.Fatalf("Expected frequency to be +/- %v, got %v", dur, f)
 		}
 	}
@@ -163,7 +164,7 @@ func TestBackoffTimeCheck(t *testing.T) {
 	// 2x the max frequency pass *after* the allowed next print,
 	// which at this point is 100ms ahead of us. So we need to
 	// sleep for at least 300ms. Sleep a bit more.
-	time.Sleep(350 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
 	// At this point, it is as if we were calling for the first time:
 	if !print.Ok() {
 		t.Fatal("Should have returned true")
@@ -172,4 +173,49 @@ func TestBackoffTimeCheck(t *testing.T) {
 	if !print.nextTime.IsZero() {
 		t.Fatal("No auto-reset done")
 	}
+}
+
+func TestIsSubjectValid(t *testing.T) {
+	subject := ""
+	for i := 0; i < 100; i++ {
+		subject += "foo."
+	}
+	subject += "foo"
+	if !IsSubjectValid(subject) {
+		t.Fatalf("Subject %q should be valid", subject)
+	}
+	subjects := []string{
+		"foo.bar*",
+		"foo.bar>",
+		"foo.bar.*",
+		"foo.bar.>",
+		"foo*.bar",
+		"foo>.bar",
+		"foo..bar",
+		".foo.bar",
+		"foo.bar.",
+		"..",
+		".",
+	}
+	for _, s := range subjects {
+		if IsSubjectValid(s) {
+			t.Fatalf("Subject %q expected to be invalid", s)
+		}
+	}
+}
+
+func TestFriendlyBytes(t *testing.T) {
+	check := func(val int64, expectedSuffix string) {
+		res := FriendlyBytes(val)
+		if !strings.HasSuffix(res, expectedSuffix) {
+			t.Fatalf("For %v, expected suffix to be %v, got %v", val, expectedSuffix, res)
+		}
+	}
+	check(1000, " B")
+	check(2000, " KB")
+	check(10<<20, " MB")
+	check(10<<30, " GB")
+	check(10<<40, " TB")
+	check(10<<50, " PB")
+	check(0xFFFFFFFFFFFFFFF, " EB")
 }

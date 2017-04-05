@@ -44,8 +44,10 @@ func TestBuildErrors(t *testing.T) {
 		if err == nil {
 			stackFatalf(t, "Expected error on build, did not get one")
 		}
-		if !strings.HasPrefix(err.Error(), errTxt) {
-			stackFatalf(t, "Expected error to be about %q, got %v", errTxt, err.Error())
+		expectedErrTxt := strings.ToLower(errTxt)
+		gotErrorTxt := strings.ToLower(err.Error())
+		if !strings.HasPrefix(gotErrorTxt, expectedErrTxt) {
+			stackFatalf(t, "Expected error to be about %q, got %v", expectedErrTxt, gotErrorTxt)
 		}
 	}
 	// Check that we get an error for negative values.
@@ -145,6 +147,22 @@ func TestBuildErrors(t *testing.T) {
 	sl.AddPerChannel("foo", cl)
 	sl.AddPerChannel("bar", &cl2)
 	expectError("Max subscriptions for channel \"foo\"")
+
+	// Reset sl
+	sl = testDefaultStoreLimits
+	cl = &ChannelLimits{}
+	sl.AddPerChannel("foo.*", cl)
+	expectError("invalid channel name")
+
+	sl = testDefaultStoreLimits
+	cl = &ChannelLimits{}
+	sl.AddPerChannel("foo.>", cl)
+	expectError("invalid channel name")
+
+	sl = testDefaultStoreLimits
+	cl = &ChannelLimits{}
+	sl.AddPerChannel("foo.", cl)
+	expectError("invalid channel name")
 }
 
 func TestAppliedInheritance(t *testing.T) {

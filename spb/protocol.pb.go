@@ -37,17 +37,20 @@ const (
 	CtrlMsg_SubUnsubscribe CtrlMsg_Type = 0
 	CtrlMsg_SubClose       CtrlMsg_Type = 1
 	CtrlMsg_ConnClose      CtrlMsg_Type = 2
+	CtrlMsg_FTHeartbeat    CtrlMsg_Type = 3
 )
 
 var CtrlMsg_Type_name = map[int32]string{
 	0: "SubUnsubscribe",
 	1: "SubClose",
 	2: "ConnClose",
+	3: "FTHeartbeat",
 }
 var CtrlMsg_Type_value = map[string]int32{
 	"SubUnsubscribe": 0,
 	"SubClose":       1,
 	"ConnClose":      2,
+	"FTHeartbeat":    3,
 }
 
 func (x CtrlMsg_Type) String() string {
@@ -100,6 +103,7 @@ type ServerInfo struct {
 	Unsubscribe string `protobuf:"bytes,5,opt,name=Unsubscribe,proto3" json:"Unsubscribe,omitempty"`
 	Close       string `protobuf:"bytes,6,opt,name=Close,proto3" json:"Close,omitempty"`
 	SubClose    string `protobuf:"bytes,7,opt,name=SubClose,proto3" json:"SubClose,omitempty"`
+	AcksSubs    string `protobuf:"bytes,8,opt,name=AcksSubs,proto3" json:"AcksSubs,omitempty"`
 }
 
 func (m *ServerInfo) Reset()         { *m = ServerInfo{} }
@@ -330,6 +334,12 @@ func (m *ServerInfo) MarshalTo(data []byte) (int, error) {
 		i = encodeVarintProtocol(data, i, uint64(len(m.SubClose)))
 		i += copy(data[i:], m.SubClose)
 	}
+	if len(m.AcksSubs) > 0 {
+		data[i] = 0x42
+		i++
+		i = encodeVarintProtocol(data, i, uint64(len(m.AcksSubs)))
+		i += copy(data[i:], m.AcksSubs)
+	}
 	return i, nil
 }
 
@@ -541,6 +551,10 @@ func (m *ServerInfo) Size() (n int) {
 		n += 1 + l + sovProtocol(uint64(l))
 	}
 	l = len(m.SubClose)
+	if l > 0 {
+		n += 1 + l + sovProtocol(uint64(l))
+	}
+	l = len(m.AcksSubs)
 	if l > 0 {
 		n += 1 + l + sovProtocol(uint64(l))
 	}
@@ -1282,6 +1296,35 @@ func (m *ServerInfo) Unmarshal(data []byte) error {
 				return io.ErrUnexpectedEOF
 			}
 			m.SubClose = string(data[iNdEx:postIndex])
+			iNdEx = postIndex
+		case 8:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field AcksSubs", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowProtocol
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				stringLen |= (uint64(b) & 0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthProtocol
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.AcksSubs = string(data[iNdEx:postIndex])
 			iNdEx = postIndex
 		default:
 			iNdEx = preIndex

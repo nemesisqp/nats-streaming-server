@@ -4,6 +4,8 @@ package stores
 
 import (
 	"fmt"
+
+	"github.com/nats-io/nats-streaming-server/util"
 )
 
 // AddPerChannel stores limits for the given channel `name` in the StoreLimits.
@@ -25,9 +27,9 @@ func (sl *StoreLimits) AddPerChannel(name string, cl *ChannelLimits) {
 func (sl *StoreLimits) Build() error {
 	// Check that there is no negative value
 	if sl.MaxChannels < 0 {
-		return fmt.Errorf("Max channels limit cannot be negative")
+		return fmt.Errorf("max channels limit cannot be negative")
 	}
-	if err := sl.checkChannelLimits(&sl.ChannelLimits, ""); err != nil {
+	if err := sl.checkChannelLimits(&sl.ChannelLimits, "", true); err != nil {
 		return err
 	}
 	// If there is no per-channel, we are done.
@@ -35,11 +37,11 @@ func (sl *StoreLimits) Build() error {
 		return nil
 	}
 	if len(sl.PerChannel) > sl.MaxChannels {
-		return fmt.Errorf("Too many channels defined (%v). The max channels limit is set to %v",
+		return fmt.Errorf("too many channels defined (%v). The max channels limit is set to %v",
 			len(sl.PerChannel), sl.MaxChannels)
 	}
 	for cn, cl := range sl.PerChannel {
-		if err := sl.checkChannelLimits(cl, cn); err != nil {
+		if err := sl.checkChannelLimits(cl, cn, false); err != nil {
 			return err
 		}
 	}
@@ -62,7 +64,11 @@ func (sl *StoreLimits) Build() error {
 	return nil
 }
 
-func (sl *StoreLimits) checkChannelLimits(cl *ChannelLimits, channelName string) error {
+func (sl *StoreLimits) checkChannelLimits(cl *ChannelLimits, channelName string, isGlobal bool) error {
+	// If not checking global limits, check for channel name validity.
+	if !isGlobal && !util.IsSubjectValid(channelName) {
+		return fmt.Errorf("invalid channel name %q", channelName)
+	}
 	// Check that there is no per-channel unlimited limit if corresponding
 	// limit is not.
 	if err := verifyLimit("subscriptions", channelName,
@@ -92,17 +98,17 @@ func verifyLimit(errText, channelName string, limit, globalLimit int64) error {
 	// global limit.
 	if channelName == "" {
 		if limit < 0 {
-			return fmt.Errorf("Max %s for global limit cannot be negative", errText)
+			return fmt.Errorf("max %s for global limit cannot be negative", errText)
 		}
 		return nil
 	}
 	// Per-channel limit specific here.
 	if limit < 0 {
-		return fmt.Errorf("Max %s for channel %q cannot be negative. "+
+		return fmt.Errorf("max %s for channel %q cannot be negative. "+
 			"Set it to 0 to be equal to the global limit of %v", errText, channelName, globalLimit)
 	}
 	if limit > globalLimit {
-		return fmt.Errorf("Max %s for channel %q cannot be higher than global limit "+
+		return fmt.Errorf("max %s for channel %q cannot be higher than global limit "+
 			"of %v", errText, channelName, globalLimit)
 	}
 	return nil

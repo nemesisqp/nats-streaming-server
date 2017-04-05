@@ -60,15 +60,24 @@ type genericMsgStore struct {
 ////////////////////////////////////////////////////////////////////////////
 
 // init initializes the structure of a generic store
-func (gs *genericStore) init(name string, limits *StoreLimits) {
+func (gs *genericStore) init(name string, limits *StoreLimits) error {
 	gs.name = name
 	if limits == nil {
 		limits = &DefaultStoreLimits
 	}
-	gs.setLimits(limits)
+	if err := gs.setLimits(limits); err != nil {
+		return err
+	}
 	// Do not use limits values to create the map.
 	gs.channels = make(map[string]*ChannelStore)
 	gs.clients = make(map[string]*Client)
+	return nil
+}
+
+// GetExclusiveLock implements the Store interface.
+func (gs *genericStore) GetExclusiveLock() (bool, error) {
+	// Need to be implementation specific.
+	return false, ErrNotSupported
 }
 
 // Init can be used to initialize the store with server's information.
@@ -79,6 +88,13 @@ func (gs *genericStore) Init(info *spb.ServerInfo) error {
 // Name returns the type name of this store
 func (gs *genericStore) Name() string {
 	return gs.name
+}
+
+// Recover implements the Store interface.
+func (gs *genericStore) Recover() (*RecoveredState, error) {
+	// Implementations that can recover their state need to
+	// override this.
+	return nil, nil
 }
 
 // setLimits makes a copy of the given StoreLimits,
@@ -112,7 +128,7 @@ func (gs *genericStore) SetLimits(limits *StoreLimits) error {
 // `true` to indicate that the channel is new, false if it already exists.
 func (gs *genericStore) CreateChannel(channel string, userData interface{}) (*ChannelStore, bool, error) {
 	// no-op
-	return nil, false, fmt.Errorf("Generic store, feature not implemented")
+	return nil, false, fmt.Errorf("generic store: feature not implemented")
 }
 
 // LookupChannel returns a ChannelStore for the given channel.

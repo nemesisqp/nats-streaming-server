@@ -4,11 +4,22 @@ package util
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
-	"os"
+	"math"
 	"time"
 )
+
+// ErrUnableToLockNow is used to indicate that a lock cannot be
+// immediately acquired.
+var ErrUnableToLockNow = errors.New("unable to acquire the lock at the moment")
+
+// LockFile is an interface for lock files utility.
+type LockFile interface {
+	io.Closer
+	IsClosed() bool
+}
 
 // ByteOrder specifies how to convert byte sequences into 16-, 32-, or 64-bit
 // unsigned integers.
@@ -119,9 +130,42 @@ func ReadInt(r io.Reader) (int, error) {
 
 // CloseFile closes the given file and report the possible error only
 // if the given error `err` is not already set.
-func CloseFile(err error, f *os.File) error {
+func CloseFile(err error, f io.Closer) error {
 	if lerr := f.Close(); lerr != nil && err == nil {
 		err = lerr
 	}
 	return err
+}
+
+// IsSubjectValid returns false if the string if any of this condition apply:
+// - is empty
+// - contains wildcards `*` or `>`
+// - token separator `.` is first or last
+// - there are two consecutives token separators `.`
+func IsSubjectValid(subject string) bool {
+	if subject == "" || subject[0] == '.' {
+		return false
+	}
+	for i := 0; i < len(subject); i++ {
+		c := subject[i]
+		if c == '*' || c == '>' ||
+			(c == '.' && (i == len(subject)-1 || subject[i+1] == '.')) {
+			return false
+		}
+	}
+	return true
+}
+
+// FriendlyBytes returns a string with the given bytes int64
+// represented as a size, such as 1KB, 10MB, etc...
+func FriendlyBytes(bytes int64) string {
+	fbytes := float64(bytes)
+	base := 1024
+	pre := []string{"K", "M", "G", "T", "P", "E"}
+	if fbytes < float64(base) {
+		return fmt.Sprintf("%v B", fbytes)
+	}
+	exp := int(math.Log(fbytes) / math.Log(float64(base)))
+	index := exp - 1
+	return fmt.Sprintf("%.2f %sB", fbytes/math.Pow(float64(base), float64(exp)), pre[index])
 }

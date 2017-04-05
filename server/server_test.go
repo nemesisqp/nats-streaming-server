@@ -1,3 +1,5 @@
+// Copyright 2016-2017 Apcera Inc. All rights reserved.
+
 package server
 
 import (
@@ -49,6 +51,8 @@ func init() {
 	defaultDataStore = tmpDir
 	// Set debug and trace for this file.
 	setDebugAndTraceToDefaultOptions(true)
+	// For FT tests, reduce the HB/Timeout intervals
+	setFTTestsHBInterval()
 }
 
 func stackFatalf(t tLogger, f string, args ...interface{}) {
@@ -71,6 +75,13 @@ func stackFatalf(t tLogger, f string, args ...interface{}) {
 
 // Helper function to shutdown last, a server that is being restarted in a test.
 func shutdownRestartedServerOnTestExit(s **StanServer) {
+	srv := *s
+	srv.Shutdown()
+	srv = nil
+}
+
+// Helper function to shutdown last, a NATS server that is being restarted in a test.
+func shutdownRestartedNATSServerOnTestExit(s **natsd.Server) {
 	srv := *s
 	srv.Shutdown()
 	srv = nil
@@ -301,6 +312,15 @@ func TestDoubleShutdown(t *testing.T) {
 	if err := Wait(ch); err != nil {
 		t.Fatal("Second shutdown blocked")
 	}
+}
+
+func TestServerStates(t *testing.T) {
+	s := runServer(t, clusterName)
+	defer s.Shutdown()
+	checkState(t, s, Standalone)
+	s.Shutdown()
+	checkState(t, s, Shutdown)
+	// FT states are checked in ft_test.go
 }
 
 type response interface {
@@ -4256,11 +4276,15 @@ func TestNonDurableRemovedFromStoreOnConnClose(t *testing.T) {
 	s.Shutdown()
 	// Open the store directly and verify that the sub record is not even found.
 	limits := stores.DefaultStoreLimits
-	store, recoveredState, err := stores.NewFileStore(defaultDataStore, &limits)
+	store, err := stores.NewFileStore(defaultDataStore, &limits)
 	if err != nil {
 		t.Fatalf("Error opening file: %v", err)
 	}
 	defer store.Close()
+	recoveredState, err := store.Recover()
+	if err != nil {
+		t.Fatalf("Error recovering state: %v", err)
+	}
 	if recoveredState == nil {
 		t.Fatal("Expected to recover state, got none")
 	}
@@ -4464,13 +4488,13 @@ func checkQueueGroupSize(t *testing.T, s *StanServer, channelName, groupName str
 	if cs == nil {
 		stackFatalf(t, "Expected channel store %q to exist", channelName)
 	}
-	s.RLock()
+	s.mu.RLock()
 	groupSize := 0
 	group, exist := cs.UserData.(*subStore).qsubs[groupName]
 	if exist {
 		groupSize = len(group.subs)
 	}
-	s.RUnlock()
+	s.mu.RUnlock()
 	if expectedExist && !exist {
 		stackFatalf(t, "Expected group to still exist, does not")
 	}
@@ -4817,30 +4841,6 @@ func TestFileStoreDurableQueueSubRedeliveryOnRejoin(t *testing.T) {
 	}
 }
 
-func TestIsValidSubject(t *testing.T) {
-	subject := ""
-	for i := 0; i < 100; i++ {
-		subject += "foo."
-	}
-	subject += "foo"
-	if !isValidSubject(subject) {
-		t.Fatalf("Subject %q should be valid", subject)
-	}
-	subjects := []string{
-		"foo.bar*",
-		"foo.bar>",
-		"foo.bar.*",
-		"foo.bar.>",
-		"foo*.bar",
-		"foo>.bar",
-	}
-	for _, s := range subjects {
-		if isValidSubject(s) {
-			t.Fatalf("Subject %q expected to be invalid", s)
-		}
-	}
-}
-
 func TestDroppedMessagesOnSendToSub(t *testing.T) {
 	opts := GetDefaultOptions()
 	opts.MaxMsgs = 3
@@ -5046,9 +5046,9 @@ func TestPerChannelLimits(t *testing.T) {
 			}
 		}
 		// Check messages count
-		s.RLock()
+		s.mu.RLock()
 		n, _, err := s.store.MsgsState("foo")
-		s.RUnlock()
+		s.mu.RUnlock()
 		if err != nil {
 			t.Fatalf("Unexpected error getting state: %v", err)
 		}
@@ -5064,9 +5064,9 @@ func TestPerChannelLimits(t *testing.T) {
 			}
 		}
 		// Check messages count
-		s.RLock()
+		s.mu.RLock()
 		n, b, err := s.store.MsgsState("bar")
-		s.RUnlock()
+		s.mu.RUnlock()
 		if err != nil {
 			t.Fatalf("Unexpected error getting state: %v", err)
 		}
@@ -5389,7 +5389,7 @@ func closeSubscriber(t *testing.T, subType string) {
 	}
 	wait()
 
-	s.RLock()
+	s.mu.RLock()
 	cs := s.store.LookupChannel("foo")
 	ss := cs.UserData.(*subStore)
 	var dur *subState
@@ -5398,7 +5398,7 @@ func closeSubscriber(t *testing.T, subType string) {
 	} else {
 		dur = ss.qsubs[durKey].subs[0]
 	}
-	s.RUnlock()
+	s.mu.RUnlock()
 	if dur == nil {
 		stackFatalf(t, "Durable should have been found")
 	}
@@ -5572,10 +5572,10 @@ func TestFileStoreQMemberRemovedFromStore(t *testing.T) {
 		t.Fatal("Did not get our message")
 	}
 	// Check server state
-	s.RLock()
+	s.mu.RLock()
 	cs, _ := s.lookupOrCreateChannel("foo")
 	ss := cs.UserData.(*subStore)
-	s.RUnlock()
+	s.mu.RUnlock()
 	ss.RLock()
 	qs := ss.qsubs["dur:group"]
 	ss.RUnlock()
@@ -5824,9 +5824,9 @@ func TestFileStoreAcksPool(t *testing.T) {
 
 	// Check server's ackSub pool
 	checkPoolSize := func() {
-		s.RLock()
+		s.mu.RLock()
 		poolSize := len(s.acksSubs)
-		s.RUnlock()
+		s.mu.RUnlock()
 		if poolSize != opts.AckSubsPoolSize {
 			stackFatalf(t, "Expected acksSubs pool size to be %v, got %v", opts.AckSubsPoolSize, poolSize)
 		}
@@ -5834,9 +5834,9 @@ func TestFileStoreAcksPool(t *testing.T) {
 	checkPoolSize()
 
 	// Check total subs and each sub's ackSub is pooled or not as expected.
-	checkAckSubs := func(total int, checkSubFunc func(sub *subState) error) {
+	checkAckSubs := func(total int32, checkSubFunc func(sub *subState) error) {
 		subs := s.clients.GetSubs(clientName)
-		if len(subs) != total {
+		if len(subs) != int(total) {
 			stackFatalf(t, "Expected %d subs, got %v", total, len(subs))
 		}
 		for _, sub := range subs {
@@ -5854,41 +5854,46 @@ func TestFileStoreAcksPool(t *testing.T) {
 	defer nc.Close()
 	defer sc.Close()
 
-	totalSubs := 10
+	totalSubs := int32(10)
 	errCh := make(chan error, totalSubs)
 	ch := make(chan bool)
 	count := int32(0)
 	cb := func(m *stan.Msg) {
 		if m.Redelivered {
 			errCh <- fmt.Errorf("Unexpected redelivered message: %v", m)
-		} else if atomic.AddInt32(&count, 1) == int32(totalSubs) {
+		} else if atomic.AddInt32(&count, 1) == atomic.LoadInt32(&totalSubs) {
 			ch <- true
 		}
 	}
 	// Create 10 subs
-	for i := 0; i < totalSubs; i++ {
+	for i := 0; i < int(totalSubs); i++ {
 		sub, err := sc.Subscribe("foo", cb, stan.AckWait(time.Second))
 		if err != nil {
 			t.Fatalf("Unexpected error on subscribe: %v", err)
 		}
 		allSubs = append(allSubs, sub)
 	}
-	// Send 1 message
-	if err := sc.Publish("foo", []byte("hello")); err != nil {
-		t.Fatalf("Unexpected error on publish: %v", err)
+	checkReceived := func(subs int32) {
+		atomic.StoreInt32(&count, 0)
+		atomic.StoreInt32(&totalSubs, subs)
+		// Send 1 message
+		if err := sc.Publish("foo", []byte("hello")); err != nil {
+			stackFatalf(t, "Unexpected error on publish: %v", err)
+		}
+		// Wait for all messages to be received
+		if err := Wait(ch); err != nil {
+			stackFatalf(t, "Did not get our messages")
+		}
+		// Wait for more than redelivery time
+		time.Sleep(1500 * time.Millisecond)
+		// Check that there was no error
+		select {
+		case e := <-errCh:
+			stackFatalf(t, e.Error())
+		default:
+		}
 	}
-	// Wait for all messages to be received
-	if err := Wait(ch); err != nil {
-		t.Fatal("Did not get our messages")
-	}
-	// Wait for more than redelivery time
-	time.Sleep(1500 * time.Millisecond)
-	// Check that there was no error
-	select {
-	case e := <-errCh:
-		t.Fatal(e)
-	default:
-	}
+	checkReceived(totalSubs)
 	// Check that server's subs have nil ackSub
 	checkAckSubs(totalSubs, func(sub *subState) error {
 		if sub.ackSub != nil {
@@ -5917,6 +5922,7 @@ func TestFileStoreAcksPool(t *testing.T) {
 		}
 		return nil
 	})
+	checkReceived(totalSubs)
 	// Restart server with no acksSub pool
 	s.Shutdown()
 	opts.AckSubsPoolSize = 0
@@ -5930,6 +5936,7 @@ func TestFileStoreAcksPool(t *testing.T) {
 		}
 		return nil
 	})
+	checkReceived(totalSubs)
 	// Add another subscriber
 	sub, err := sc.Subscribe("foo", func(_ *stan.Msg) {})
 	if err != nil {
@@ -5941,7 +5948,7 @@ func TestFileStoreAcksPool(t *testing.T) {
 	s = runServerWithOpts(t, opts, nil)
 	// Check that the new sub's AckInbox is _INBOX as usual.
 	checkAckSubs(totalSubs+1, func(sub *subState) error {
-		if int(sub.ID) > totalSubs {
+		if int(sub.ID) > int(totalSubs) {
 			if sub.AckInbox[:len(nats.InboxPrefix)] != nats.InboxPrefix {
 				return fmt.Errorf("Unexpected AckInbox: %v", sub)
 			}
@@ -5965,9 +5972,10 @@ func TestFileStoreAcksPool(t *testing.T) {
 	}
 	// Create a subscription without call unsubscribe and make
 	// sure it does not prevent closing of connection.
-	if _, err := sc.Subscribe("foo", func(_ *stan.Msg) {}); err != nil {
+	if _, err := sc.Subscribe("foo", cb, stan.AckWait(time.Second)); err != nil {
 		t.Fatalf("Error on subscribe: %v", err)
 	}
+	checkReceived(1)
 	// Close the client connection
 	sc.Close()
 	nc.Close()
@@ -6024,15 +6032,15 @@ func TestAckSubsSubjectsInPoolUseUniqueSubject(t *testing.T) {
 	// Wait for ack of sc2 to be processed by s2
 	waitForAcks(t, s2, "otherClient", 1, 0)
 
-	s1.Lock()
+	s1.mu.Lock()
 	s1AcksReceived, _ := s1.acksSubs[0].Delivered()
-	s1.Unlock()
+	s1.mu.Unlock()
 	if s1AcksReceived != 1 {
 		t.Fatalf("Expected pooled ack sub to receive only 1 message, got %v", s1AcksReceived)
 	}
-	s2.Lock()
+	s2.mu.Lock()
 	s2AcksReceived, _ := s2.acksSubs[0].Delivered()
-	s2.Unlock()
+	s2.mu.Unlock()
 	if s2AcksReceived != 1 {
 		t.Fatalf("Expected pooled ack sub to receive only 1 message, got %v", s2AcksReceived)
 	}

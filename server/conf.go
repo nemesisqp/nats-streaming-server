@@ -1,4 +1,4 @@
-// Copyright 2016 Apcera Inc. All rights reserved.
+// Copyright 2016-2017 Apcera Inc. All rights reserved.
 
 package server
 
@@ -11,6 +11,7 @@ import (
 
 	"github.com/nats-io/gnatsd/conf"
 	"github.com/nats-io/nats-streaming-server/stores"
+	"github.com/nats-io/nats-streaming-server/util"
 )
 
 // ProcessConfigFile parses the configuration file `configFile` and updates
@@ -47,7 +48,7 @@ func ProcessConfigFile(configFile string, opts *Options) error {
 			case stores.TypeMemory:
 				opts.StoreType = stores.TypeMemory
 			default:
-				return fmt.Errorf("Unknown store type: %v", v.(string))
+				return fmt.Errorf("unknown store type: %v", v.(string))
 			}
 		case "dir", "datastore":
 			if err := checkType(k, reflect.String, v); err != nil {
@@ -114,6 +115,11 @@ func ProcessConfigFile(configFile string, opts *Options) error {
 				return err
 			}
 			opts.AckSubsPoolSize = int(v.(int64))
+		case "ft_group", "ft_group_name":
+			if err := checkType(k, reflect.String, v); err != nil {
+				return err
+			}
+			opts.FTGroupName = v.(string)
 		}
 	}
 	return nil
@@ -123,7 +129,7 @@ func ProcessConfigFile(configFile string, opts *Options) error {
 func checkType(name string, kind reflect.Kind, v interface{}) error {
 	actualKind := reflect.TypeOf(v).Kind()
 	if actualKind != kind {
-		return fmt.Errorf("Parameter %q value is expected to be %v, got %v",
+		return fmt.Errorf("parameter %q value is expected to be %v, got %v",
 			name, kind.String(), actualKind.String())
 	}
 	return nil
@@ -133,7 +139,7 @@ func checkType(name string, kind reflect.Kind, v interface{}) error {
 func parseTLS(itf interface{}, opts *Options) error {
 	m, ok := itf.(map[string]interface{})
 	if !ok {
-		return fmt.Errorf("Expected TLS to be a map/struct, got %v", itf)
+		return fmt.Errorf("expected TLS to be a map/struct, got %v", itf)
 	}
 	for k, v := range m {
 		name := strings.ToLower(k)
@@ -162,7 +168,7 @@ func parseTLS(itf interface{}, opts *Options) error {
 func parseStoreLimits(itf interface{}, opts *Options) error {
 	m, ok := itf.(map[string]interface{})
 	if !ok {
-		return fmt.Errorf("Expected store limits to be a map/struct, got %v", itf)
+		return fmt.Errorf("expected store limits to be a map/struct, got %v", itf)
 	}
 	for k, v := range m {
 		name := strings.ToLower(k)
@@ -221,12 +227,15 @@ func parseChannelLimits(cl *stores.ChannelLimits, k, name string, v interface{})
 func parsePerChannelLimits(itf interface{}, opts *Options) error {
 	m, ok := itf.(map[string]interface{})
 	if !ok {
-		return fmt.Errorf("Expected per channel limits to be a map/struct, got %v", itf)
+		return fmt.Errorf("expected per channel limits to be a map/struct, got %v", itf)
 	}
 	for channelName, limits := range m {
 		limitsMap, ok := limits.(map[string]interface{})
 		if !ok {
-			return fmt.Errorf("Expected channel limits to be a map/struct, got %v", limits)
+			return fmt.Errorf("expected channel limits to be a map/struct, got %v", limits)
+		}
+		if !util.IsSubjectValid(channelName) {
+			return fmt.Errorf("invalid channel name %q", channelName)
 		}
 		cl := &stores.ChannelLimits{}
 		for k, v := range limitsMap {
@@ -244,7 +253,7 @@ func parsePerChannelLimits(itf interface{}, opts *Options) error {
 func parseFileOptions(itf interface{}, opts *Options) error {
 	m, ok := itf.(map[string]interface{})
 	if !ok {
-		return fmt.Errorf("Expected file options to be a map/struct, got %v", itf)
+		return fmt.Errorf("expected file options to be a map/struct, got %v", itf)
 	}
 	for k, v := range m {
 		name := strings.ToLower(k)
