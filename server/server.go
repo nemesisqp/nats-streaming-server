@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/url"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,7 +31,7 @@ import (
 // Server defaults.
 const (
 	// VERSION is the current version for the NATS Streaming server.
-	VERSION = "0.4.0"
+	VERSION = "0.4.1"
 
 	DefaultClusterID      = "test-cluster"
 	DefaultDiscoverPrefix = "_STAN.discover"
@@ -509,7 +510,7 @@ func (ss *subStore) Remove(cs *stores.ChannelStore, sub *subState, unsubscribe b
 		} else {
 			now := time.Now().UnixNano()
 			// If there are pending messages in this sub, they need to be
-			// transfered to remaining queue subscribers.
+			// transferred to remaining queue subscribers.
 			numQSubs := len(qs.subs)
 			idx := 0
 			sub.RLock()
@@ -533,7 +534,7 @@ func (ss *subStore) Remove(cs *stores.ChannelStore, sub *subState, unsubscribe b
 					qsub.Unlock()
 					continue
 				}
-				// We don't need to update if the sub's lastSent is transfered
+				// We don't need to update if the sub's lastSent is transferred
 				// to another queue subscriber.
 				if storageUpdate && m.Sequence == qs.lastSent {
 					storageUpdate = false
@@ -544,7 +545,7 @@ func (ss *subStore) Remove(cs *stores.ChannelStore, sub *subState, unsubscribe b
 				}
 				// As of now, members can have different AckWait values.
 				expirationTime := pm.expire
-				// If the member the message is transfered to has a higher AckWait,
+				// If the member the message is transferred to has a higher AckWait,
 				// keep original expiration time, otherwise check that it is smaller
 				// than the new AckWait.
 				if sub.ackWait > qsub.ackWait && expirationTime-now > 0 {
@@ -884,6 +885,7 @@ func RunServerWithOpts(stanOpts *Options, natsOpts *server.Options) (newServer *
 	// for instance with FT. Some err/warn messages may be printed
 	// regarding other instance's ID, so print it on startup.
 	Noticef("ServerID: %v", s.serverID)
+	Noticef("Go version: %v", runtime.Version())
 
 	// Ensure that we shutdown the server if there is a panic/error during startup.
 	// This will ensure that stores are closed (which otherwise would cause
@@ -930,7 +932,7 @@ func RunServerWithOpts(stanOpts *Options, natsOpts *server.Options) (newServer *
 		return nil, err
 	}
 	// StanServer.store (s.store here) is of type stores.Store, which is an
-	// interace. If we assign s.store in the call of the constructor and there
+	// interface. If we assign s.store in the call of the constructor and there
 	// is an error, although the call returns "nil" for the store, we can no
 	// longer have a test such as "if s.store != nil" (as we do in shutdown).
 	// This is because the constructors return a store implementention.
@@ -1085,15 +1087,15 @@ func (s *StanServer) start(runningState State) error {
 	Noticef("Message store is %s", s.store.Name())
 	Noticef("--------- Store Limits ---------")
 	Noticef("Channels:        %s",
-		getLimitStr(true, int64(limits.MaxChannels),
+		getLimitStr(int64(limits.MaxChannels),
 			int64(stores.DefaultStoreLimits.MaxChannels),
 			limitCount))
 	Noticef("-------- channels limits -------")
-	printLimits(true, &limits.ChannelLimits,
+	printLimits(&limits.ChannelLimits,
 		&stores.DefaultStoreLimits.ChannelLimits)
 	for cn, cl := range limits.PerChannel {
 		Noticef("Channel: %q", cn)
-		printLimits(false, cl, &limits.ChannelLimits)
+		printLimits(cl, &limits.ChannelLimits)
 	}
 	Noticef("--------------------------------")
 
@@ -1105,23 +1107,20 @@ func (s *StanServer) start(runningState State) error {
 	return nil
 }
 
-func printLimits(isGlobal bool, limits, parentLimits *stores.ChannelLimits) {
+func printLimits(limits, parentLimits *stores.ChannelLimits) {
 	plMaxSubs := int64(parentLimits.MaxSubscriptions)
 	plMaxMsgs := int64(parentLimits.MaxMsgs)
 	plMaxBytes := parentLimits.MaxBytes
 	plMaxAge := parentLimits.MaxAge
-	Noticef("  Subscriptions: %s", getLimitStr(isGlobal, int64(limits.MaxSubscriptions), plMaxSubs, limitCount))
-	Noticef("  Messages     : %s", getLimitStr(isGlobal, int64(limits.MaxMsgs), plMaxMsgs, limitCount))
-	Noticef("  Bytes        : %s", getLimitStr(isGlobal, limits.MaxBytes, plMaxBytes, limitBytes))
-	Noticef("  Age          : %s", getLimitStr(isGlobal, int64(limits.MaxAge), int64(plMaxAge), limitDuration))
+	Noticef("  Subscriptions: %s", getLimitStr(int64(limits.MaxSubscriptions), plMaxSubs, limitCount))
+	Noticef("  Messages     : %s", getLimitStr(int64(limits.MaxMsgs), plMaxMsgs, limitCount))
+	Noticef("  Bytes        : %s", getLimitStr(limits.MaxBytes, plMaxBytes, limitBytes))
+	Noticef("  Age          : %s", getLimitStr(int64(limits.MaxAge), int64(plMaxAge), limitDuration))
 }
 
-func getLimitStr(isGlobal bool, val, parentVal int64, limitType int) string {
+func getLimitStr(val, parentVal int64, limitType int) string {
 	valStr := ""
 	inherited := ""
-	if !isGlobal && val == 0 {
-		val = parentVal
-	}
 	if val == parentVal {
 		inherited = " *"
 	}
@@ -1140,7 +1139,7 @@ func getLimitStr(isGlobal bool, val, parentVal int64, limitType int) string {
 	return fmt.Sprintf("%13s%s", valStr, inherited)
 }
 
-// TODO:  Explore parameter passing in gnatsd.  Keep seperate for now.
+// TODO:  Explore parameter passing in gnatsd.  Keep separate for now.
 func (s *StanServer) configureClusterOpts(opts *server.Options) error {
 	// If we don't have cluster defined in the configuration
 	// file and no cluster listen string override, but we do
@@ -2056,7 +2055,7 @@ func (s *StanServer) sendMsgToQueueGroup(qs *queueState, m *pb.MsgProto, force b
 	return sub, didSend, sendMore
 }
 
-// processMsg will proces a message, and possibly send to clients, etc.
+// processMsg will process a message, and possibly send to clients, etc.
 func (s *StanServer) processMsg(cs *stores.ChannelStore) {
 	ss := cs.UserData.(*subStore)
 
@@ -3122,7 +3121,7 @@ func (s *StanServer) processSubscriptionsStart() {
 			qs := subStart.qs
 			isDurable := subStart.isDurable
 			if isDurable {
-				// Redeliver any oustanding.
+				// Redeliver any outstanding.
 				s.performDurableRedelivery(cs, sub)
 			}
 			// publish messages to this subscriber

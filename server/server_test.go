@@ -2287,20 +2287,24 @@ func TestStartPositionFirstSequence(t *testing.T) {
 	defer sub2.Unsubscribe()
 
 	first := true
-	select {
-	case m := <-mch:
-		if first {
-			if string(m.Data) != "msg1" {
-				t.Fatalf("Expected msg1 first, got %v", string(m.Data))
+	for {
+		select {
+		case m := <-mch:
+			if first {
+				if string(m.Data) != "msg1" {
+					t.Fatalf("Expected msg1 first, got %v", string(m.Data))
+				}
+				first = false
+			} else {
+				if string(m.Data) != "msg2" {
+					t.Fatalf("Expected msg2 second, got %v", string(m.Data))
+				}
+				// We are done!
+				return
 			}
-			first = false
-		} else {
-			if string(m.Data) != "msg2" {
-				t.Fatalf("Expected msg2 second, got %v", string(m.Data))
-			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("Did not get our message")
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Did not get our message")
 	}
 }
 
@@ -6130,5 +6134,80 @@ func TestNewOnHoldSetOnDurableRestart(t *testing.T) {
 	// Check our success
 	if failed {
 		t.Fatal("Did not receive the redelivered messages first")
+	}
+}
+
+func TestUnlimitedPerChannelLimits(t *testing.T) {
+	opts := GetDefaultOptions()
+	opts.StoreLimits.MaxChannels = 2
+	// Set very small global limits
+	opts.StoreLimits.MaxMsgs = 1
+	opts.StoreLimits.MaxBytes = 1
+	opts.StoreLimits.MaxAge = time.Millisecond
+	opts.StoreLimits.MaxSubscriptions = 1
+	// Add a channel that has all unlimited values
+	cl := &stores.ChannelLimits{}
+	cl.MaxMsgs = -1
+	cl.MaxBytes = -1
+	cl.MaxAge = -1
+	cl.MaxSubscriptions = -1
+	opts.StoreLimits.AddPerChannel("foo", cl)
+	s := runServerWithOpts(t, opts, nil)
+	defer s.Shutdown()
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+	// Check that we can send more than 1 message of more than 1 byte
+	total := 10
+	for i := 0; i < total; i++ {
+		if err := sc.Publish("foo", []byte("hello")); err != nil {
+			t.Fatalf("Unexpected error on publish: %v", err)
+		}
+	}
+	count := int32(0)
+	ch := make(chan bool)
+	cb := func(_ *stan.Msg) {
+		if c := atomic.AddInt32(&count, 1); c == int32(2*total) {
+			ch <- true
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := sc.Subscribe("foo", cb, stan.DeliverAllAvailable()); err != nil {
+			t.Fatalf("Unexpected error on subscribe: %v", err)
+		}
+	}
+	if err := Wait(ch); err != nil {
+		t.Fatal("Did not get our messages")
+	}
+	// Wait for more than the global limit MaxAge and verify messages
+	// are still there
+	time.Sleep(15 * time.Millisecond)
+	s.mu.RLock()
+	n, _, _ := s.store.MsgsState("foo")
+	s.mu.RUnlock()
+	if n != total {
+		t.Fatalf("Should be %v messages, store reports %v", total, n)
+	}
+	// Now use a channel not defined in PerChannel and we should be subject
+	// to global limits.
+	for i := 0; i < total; i++ {
+		if err := sc.Publish("bar", []byte("hello")); err != nil {
+			t.Fatalf("Unexpected error on publish: %v", err)
+		}
+	}
+	if _, err := sc.Subscribe("bar", func(_ *stan.Msg) {}); err != nil {
+		t.Fatalf("Unexpected error on subscribe: %v", err)
+	}
+	// This one should fail
+	if _, err := sc.Subscribe("bar", func(_ *stan.Msg) {}); err == nil {
+		t.Fatal("Expected to fail to subscribe, did not")
+	}
+	// Wait more than MaxAge
+	time.Sleep(15 * time.Millisecond)
+	// Messages should have all disappear
+	s.mu.RLock()
+	n, _, _ = s.store.MsgsState("bar")
+	s.mu.RUnlock()
+	if n != 0 {
+		t.Fatalf("Expected 0 messages, store reports %v", n)
 	}
 }

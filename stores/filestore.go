@@ -148,7 +148,7 @@ type FileStoreOptions struct {
 	// slice (and the corresponding index file) is going to be removed.
 	// The script will be invoked with the channel name and names of data and
 	// index files (which both have been previously renamed with a '.bak'
-	// extension). It is the responsability of the script to move/remove
+	// extension). It is the responsibility of the script to move/remove
 	// those files.
 	SliceArchiveScript string
 
@@ -798,11 +798,12 @@ func (fm *filesManager) openFile(file *file) error {
 		fm.Unlock()
 		return fmt.Errorf("unable to open file %q, store is being closed", file.name)
 	}
-	if _, exists := fm.files[file.id]; !exists {
+	curState := atomic.LoadInt32(&file.state)
+	if curState == fileRemoved {
 		fm.Unlock()
 		return fmt.Errorf("unable to open file %q, it has been removed", file.name)
 	}
-	if curState := atomic.LoadInt32(&file.state); curState != fileClosed || file.handle != nil {
+	if curState != fileClosed || file.handle != nil {
 		fm.Unlock()
 		panic(fmt.Errorf("request to open file %q but invalid state: handle=%v - state=%v", file.name, file.handle, file.state))
 	}
@@ -942,11 +943,12 @@ func (fm *filesManager) trySwitchState(file *file, newState int32) (bool, error)
 // for its state). So it is still possible for caller to read/write (if handle is
 // valid) or close this file.
 func (fm *filesManager) remove(file *file) bool {
+	fm.Lock()
 	wasOpened, err := fm.trySwitchState(file, fileRemoved)
 	if err != nil {
+		fm.Unlock()
 		return false
 	}
-	fm.Lock()
 	// With code above, we can't be removing a file twice, so no need to check if
 	// file is present in map.
 	delete(fm.files, file.id)
@@ -1467,7 +1469,7 @@ func (fs *FileStore) compactClientFile(orgFileName string) error {
 	if err := os.Rename(tmpFile.Name(), orgFileName); err != nil {
 		return err
 	}
-	// Avoid unnecesary attempt to cleanup
+	// Avoid unnecessary attempt to cleanup
 	tmpFile = nil
 
 	fs.cliDeleteRecs = 0

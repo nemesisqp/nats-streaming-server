@@ -9,11 +9,13 @@ import (
 	"hash/crc32"
 	"io"
 	"io/ioutil"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -97,7 +99,7 @@ func TestFSFilesManager(t *testing.T) {
 		t.Fatal("Got nil file on success")
 	}
 	// Check content
-	// The callback cannot be checked, we need to temporarly set to nil
+	// The callback cannot be checked, we set it to nil for the DeepEqual call.
 	firstFile.beforeClose = nil
 	expectedFile := file{
 		id:     fileID(1),
@@ -288,6 +290,39 @@ func TestFSFilesManager(t *testing.T) {
 	// Trying to open a removed file should fail.
 	if err := fm.openFile(testcloseOrOpenedFile); err == nil {
 		t.Fatal("Should have been unable to open a removed file")
+	}
+	// Try to do concurrent lock/unlock while file is being removed
+	for i := 0; i < 20; i++ {
+		fileToRemove, err := fm.createFile("concurrentremove", defaultFileFlags, nil)
+		if err != nil {
+			t.Fatalf("Error creating file: %v", err)
+		}
+		fm.unlockFile(fileToRemove)
+		wg := sync.WaitGroup{}
+		wg.Add(1)
+		ch := make(chan bool)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ch:
+					return
+				default:
+					if _, err := fm.lockFile(fileToRemove); err == nil {
+						fm.unlockFile(fileToRemove)
+					}
+				}
+			}
+		}()
+		time.Sleep(time.Duration(rand.Intn(45)+5) * time.Millisecond)
+		removed := fm.remove(fileToRemove)
+		ch <- true
+		wg.Wait()
+		if !removed {
+			fm.remove(fileToRemove)
+		}
+		fileToRemove.handle.Close()
+		os.Remove(fileToRemove.name)
 	}
 
 	// Following tests are supposed to produce panic
@@ -2929,7 +2964,7 @@ func TestFSWriteRecord(t *testing.T) {
 		t.Fatalf("Unexpected content: %v", retBuf[recordHeaderSize:])
 	}
 
-	// Check for marshalling error
+	// Check for marshaling error
 	w.reset()
 	errReturned := fmt.Errorf("Fake error")
 	corruptRec := &recordProduceErrorOnMarshal{errToReturn: errReturned}
@@ -3329,7 +3364,7 @@ func TestFSFirstEmptySliceRemovedOnCreateNewSlice(t *testing.T) {
 		t.Fatalf("Message should have expired")
 	}
 
-	// First slice should still exist altough empty
+	// First slice should still exist although empty
 	ms := cs.Msgs.(*FileMsgStore)
 	ms.RLock()
 	numFiles := len(ms.files)
@@ -3567,7 +3602,7 @@ func TestFSSubStoreVariousBufferSizes(t *testing.T) {
 			}
 			// Cause buffer to expand again
 			fillBuffer()
-			// Check that request should have been cancelled.
+			// Check that request should have been canceled.
 			ss.RLock()
 			shrinkReq = ss.bw.shrinkReq
 			ss.RUnlock()
@@ -3728,7 +3763,7 @@ func TestFSMsgStoreVariousBufferSizes(t *testing.T) {
 			}
 			// Cause buffer to expand again
 			fillBuffer()
-			// Check that request should have been cancelled.
+			// Check that request should have been canceled.
 			ms.RLock()
 			shrinkReq = ms.bw.shrinkReq
 			ms.RUnlock()
